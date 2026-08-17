@@ -41,6 +41,15 @@ from another machine on your LAN and type messages back into the agent.
   Other `/`-prefixed input follows terminal semantics (skills, prompt
   templates; unknown text goes to the model as literal text).
 - The **Stop** button in the web header behaves like Esc in the terminal.
+- **Answering agent questions from the web** — when the agent calls
+  `ask_user_question` (the rpiv-ask-user-question extension) while a web
+  client is connected, the questions appear in a web modal (options, a
+  `Type something.` row, optional note, live previews) AND in a minimal
+  terminal overlay; whichever answer lands first wins, the other surface
+  closes, and the agent continues with the answer in the tool's standard
+  result wording. With no web client connected, the tool's own terminal flow
+  runs unchanged. Note: pi marks blocked calls as error results internally;
+  the web view renders answered/declined questionnaires without error styling.
 - The header also shows live context usage as `45k/200k (23%)` — current context
   tokens / the model's context window / percent (same source as the terminal's
   `/context`). It updates after each agent run and on model change, and reads
@@ -57,9 +66,14 @@ from another machine on your LAN and type messages back into the agent.
 - `npm install` (dev-only type deps), then:
   - `node selftest.ts` — unit + HTTP-protocol checks (password, tokens/cookie,
     sanitizer, leaf diff, page syntax + usage/meta formatting, full server
-    against a fake pi api).
+    against a fake pi api, ask bridge: envelope wording, TUI component,
+    HTTP ask flow, tool_call hook wiring — first-answer-wins, decline,
+    duplicate 409, client-left fallback).
   - `npx tsc -p tsconfig.json` — strict type check.
 - Manual e2e checklist: `pi -e ./index.ts` → `/webserve start` → login in a
   browser → watch live streaming → send a message from the web (appears in the
   TUI) → `/compact` and `/new` from the web (new session shows in the view) →
-  Stop mid-run → `/webserve stop` → second terminal lands on port 8766.
+  ask the agent an ambiguous question to trigger `ask_user_question` → answer
+  from the web modal (agent continues with the answer; also try answering in
+  the terminal, and with both open at once — first answer wins) → Stop mid-run
+  → `/webserve stop` → second terminal lands on port 8766.

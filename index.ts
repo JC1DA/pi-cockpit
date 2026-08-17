@@ -5,10 +5,14 @@
  *   /webserve stop
  *   /webserve status
  *
- * Zero runtime dependencies: node:http + node:crypto + node:os + node:fs only.
- * The pi import below is type-only (erased at runtime).
+ * Zero external runtime dependencies: node:http + node:crypto + node:os + node:fs,
+ * plus pi's own bundled @earendil-works/pi-tui (matchesKey/visibleWidth) for the
+ * terminal-side questionnaire of the ask bridge. The pi-coding-agent import is
+ * type-only (erased at runtime).
  */
 import type { ContextUsage, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { Component } from "@earendil-works/pi-tui";
+import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 import http from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { networkInterfaces } from "node:os";
@@ -141,6 +145,276 @@ export function inputOpts(text: string, idle: boolean): { deliverAs?: "followUp"
     expandPromptTemplates: text.startsWith("/"),
   };
 }
+
+// ---------------------------------------------------------------------------
+// ask_user_question bridge — answer the agent's questions from the web
+// ---------------------------------------------------------------------------
+// The rpiv-ask-user-question extension's tool blocks on a terminal TUI
+// overlay. This bridge intercepts the tool call (pi's tool_call hook, which
+// runs before the tool executes and can short-circuit it with a result the
+// model sees), shows the questions in the web viewer AND in a minimal
+// terminal overlay, and feeds whichever answer arrives first back as the
+// tool's result text — word-for-word the wording the tool itself produces.
+// When no web client is connected the hook stays out of the way and the
+// tool's own (richer) TUI flow runs unchanged.
+// ---------------------------------------------------------------------------
+
+export interface AskOption {
+  label: string;
+  description?: string;
+  /** Capped at PREVIEW_LIMIT when forwarded to the web (keeps SSE payloads sane). */
+  preview?: string;
+}
+
+export interface AskQuestion {
+  question: string;
+  header?: string;
+  multiSelect?: boolean;
+  options: AskOption[];
+}
+
+export interface AskAnswer {
+  index: number; // question index
+  kind: "option" | "custom" | "multi";
+  answer?: string | null; // option label or typed text; null for multi
+  selected?: string[]; // chosen labels (multi only)
+  notes?: string;
+}
+
+export interface AskOutcome {
+  cancelled: boolean;
+  answers: AskAnswer[];
+}
+
+/** Option labels the rpiv tool rejects at runtime; we let its own validator report those. */
+export const ASK_RESERVED_LABELS = ["Other", "Type something.", "Next"];
+
+const PREVIEW_LIMIT = 2000;
+
+/** Normalize raw `event.input.questions` into AskQuestion[]. null = malformed. */
+export function extractAskQuestions(raw: unknown): AskQuestion[] | null {
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 4) return null;
+  const out: AskQuestion[] = [];
+  for (const q of raw) {
+    if (!q || typeof (q as AnyRec).question !== "string") return null;
+    const optsRaw = (q as AnyRec).options;
+    if (!Array.isArray(optsRaw) || optsRaw.length < 2 || optsRaw.length > 4) return null;
+    const options: AskOption[] = [];
+    for (const o of optsRaw) {
+      if (!o || typeof (o as AnyRec).label !== "string" || typeof (o as AnyRec).description !== "string") return null;
+      const opt: AskOption = { label: (o as AnyRec).label as string, description: (o as AnyRec).description as string };
+      if (typeof (o as AnyRec).preview === "string") opt.preview = ((o as AnyRec).preview as string).slice(0, PREVIEW_LIMIT);
+      options.push(opt);
+    }
+    const outQ: AskQuestion = { question: (q as AnyRec).question as string, options };
+    if (typeof (q as AnyRec).header === "string") outQ.header = (q as AnyRec).header as string;
+    if (typeof (q as AnyRec).multiSelect === "boolean") outQ.multiSelect = (q as AnyRec).multiSelect as boolean;
+    out.push(outQ);
+  }
+  return out;
+}
+
+const ASK_DECLINE = "User declined to answer questions";
+const ASK_NO_INPUT = "(no input)";
+
+/**
+ * Build the tool result text for an outcome — word-for-word what
+ * rpiv-ask-user-question returns for the same answers (the agent is
+ * conditioned on this wording, so it must match exactly; pinned by selftest).
+ */
+export function buildAskEnvelope(questions: AskQuestion[], outcome: AskOutcome): string {
+  if (outcome.cancelled) return ASK_DECLINE;
+  const segs: string[] = [];
+  for (let i = 0; i < questions.length; i++) {
+    const a = outcome.answers.find((x) => x.index === i);
+    if (!a) continue; // partial submission: unanswered questions contribute no segment
+    const scalar = a.kind === "multi"
+      ? (a.selected && a.selected.length > 0 ? a.selected.join(", ") : ASK_NO_INPUT)
+      : (a.answer && a.answer.length > 0 ? a.answer : ASK_NO_INPUT);
+    const parts = ['"' + questions[i].question + '"="' + scalar + '"'];
+    if (a.notes && a.notes.length > 0) parts.push("user notes: " + a.notes);
+    segs.push(parts.join(". ") + ".");
+  }
+  if (segs.length === 0) return ASK_DECLINE;
+  return "User has answered your questions: " + segs.join(" ") + " You can now continue with the user's answers in mind.";
+}
+
+// --- Minimal terminal questionnaire (terminal side of the bridge) ---
+
+function fitText(s: string, max: number): string {
+  if (visibleWidth(s) <= max) return s;
+  const chars = [...s];
+  while (chars.length > 0 && visibleWidth(chars.join("")) > max) chars.pop();
+  return chars.join("");
+}
+
+function wrapText(s: string, max: number, maxLines = 3): string[] {
+  const out: string[] = [];
+  let line = "";
+  const breakLine = (next: string): void => {
+    const sp = line.lastIndexOf(" ");
+    if (sp > 0 && sp < line.length - 1) {
+      out.push(line.slice(0, sp));
+      line = line.slice(sp + 1) + next;
+    } else {
+      if (line) out.push(fitText(line, max));
+      line = fitText(next, max);
+    }
+    if (out.length > maxLines) {
+      out.length = maxLines;
+      const last = out[maxLines - 1];
+      out[maxLines - 1] = fitText(last.endsWith("…") ? last : last + "…", max);
+    }
+  };
+  for (const ch of s) {
+    if (visibleWidth(line + ch) > max) breakLine(ch);
+    else line += ch;
+  }
+  if (line) out.push(line);
+  return out.length > 0 ? out : [""];
+}
+
+function boxTop(title: string, inner: number): string {
+  const label = " " + title + " ";
+  return "┌─" + label + "─".repeat(Math.max(0, inner - visibleWidth(label) - 1));
+}
+
+function boxLine(content: string, inner: number): string {
+  const body = fitText(content, inner);
+  return "│" + body + " ".repeat(Math.max(0, inner - visibleWidth(body))) + "│";
+}
+
+function boxBottom(inner: number): string {
+  return "└" + "─".repeat(inner - 1);
+}
+
+/**
+ * One-question-at-a-time terminal questionnaire. ↑/↓ move, Enter picks
+ * (single-select) or advances (multi-select), Space toggles (multi-select),
+ * the "Type something." row takes free text, Esc cancels the whole thing.
+ * `done(outcome)` answers; `done(null)` (via close()) means "no answer, the
+ * web side won" — the overlay hides either way.
+ */
+export class AskTuiComponent implements Component {
+  private questions: AskQuestion[];
+  private tui: { requestRender(): void };
+  private done: (o: AskOutcome | null) => void;
+  private qIndex = 0;
+  private cursor = 0;
+  private mode: "list" | "type" = "list";
+  private draft = "";
+  private selected: boolean[];
+  private answers: AskAnswer[] = [];
+  private settled = false;
+
+  constructor(questions: AskQuestion[], tui: { requestRender(): void }, done: (o: AskOutcome | null) => void) {
+    this.questions = questions;
+    this.tui = tui;
+    this.done = done;
+    this.selected = new Array(this.questions[0].options.length).fill(false);
+  }
+
+  invalidate(): void { this.rerender(); }
+  dispose(): void { /* nothing to release */ }
+
+  render(width: number): string[] {
+    const q = this.questions[this.qIndex];
+    const inner = Math.max(24, Math.min(width, 80) - 2);
+    const lines: string[] = [];
+    lines.push(boxTop("Ask you (" + (this.qIndex + 1) + "/" + this.questions.length + ")", inner));
+    for (const l of wrapText(q.question, inner)) lines.push(boxLine(l, inner));
+    lines.push(boxLine("", inner));
+    q.options.forEach((o, i) => {
+      const mark = this.mode === "list" && this.cursor === i ? ">" : " ";
+      const check = q.multiSelect ? (this.selected[i] ? "x" : " ") : " ";
+      const text = o.label + (o.description ? " — " + o.description : "");
+      lines.push(boxLine(" " + mark + " " + check + " " + (i + 1) + ". " + text, inner));
+    });
+    const cmark = this.mode === "list" && this.cursor === q.options.length ? ">" : " ";
+    lines.push(boxLine(" " + cmark + "     " + ASK_RESERVED_LABELS[1], inner));
+    if (this.mode === "type") lines.push(boxLine("    > " + this.draft, inner));
+    lines.push(boxLine("", inner));
+    const hint = q.multiSelect ? "↑/↓ move  Space toggle  Enter next  Esc cancel" : "↑/↓ move  Enter pick  Esc cancel";
+    lines.push(boxLine(hint, inner));
+    lines.push(boxBottom(inner));
+    return lines;
+  }
+
+  handleInput(data: string): void {
+    if (this.settled) return;
+    const q = this.questions[this.qIndex];
+    if (matchesKey(data, "escape")) { this.finish(true); return; }
+    if (this.mode === "type") {
+      if (matchesKey(data, "enter")) {
+        const text = this.draft.trim();
+        this.answers.push({ index: this.qIndex, kind: "custom", answer: text.length > 0 ? text : null });
+        this.advance();
+        return;
+      }
+      if (matchesKey(data, "backspace")) { this.draft = this.draft.slice(0, -1); this.rerender(); return; }
+      if (matchesKey(data, "ctrl+u")) { this.draft = ""; this.rerender(); return; }
+      if (data.length === 1 && data >= " " && data <= "\u007e") { this.draft += data; this.rerender(); } // space is a normal char here
+      return;
+    }
+    const rows = q.options.length + 1;
+    if (matchesKey(data, "up")) { this.cursor = (this.cursor + rows - 1) % rows; this.rerender(); return; }
+    if (matchesKey(data, "down")) { this.cursor = (this.cursor + 1) % rows; this.rerender(); return; }
+    if (matchesKey(data, "space")) {
+      if (q.multiSelect && this.cursor < q.options.length) { this.selected[this.cursor] = !this.selected[this.cursor]; this.rerender(); }
+      return;
+    }
+    if (matchesKey(data, "enter")) {
+      if (this.cursor < q.options.length) {
+        if (q.multiSelect) {
+          this.answers.push({ index: this.qIndex, kind: "multi", answer: null, selected: q.options.filter((_, i) => this.selected[i]).map((o) => o.label) });
+          this.advance();
+        } else {
+          this.answers.push({ index: this.qIndex, kind: "option", answer: q.options[this.cursor].label });
+          this.advance();
+        }
+      } else {
+        this.mode = "type";
+        this.draft = "";
+        this.rerender();
+      }
+    }
+  }
+
+  private rerender(): void { if (!this.settled) this.tui.requestRender(); }
+
+  private advance(): void {
+    this.mode = "list";
+    this.draft = "";
+    this.cursor = 0;
+    this.qIndex++;
+    if (this.qIndex >= this.questions.length) this.finish(false);
+    else {
+      this.selected = new Array(this.questions[this.qIndex].options.length).fill(false);
+      this.rerender();
+    }
+  }
+
+  private finish(cancelled: boolean): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.tui.requestRender();
+    this.done({ cancelled, answers: this.answers });
+  }
+
+  /**
+   * Close without an answer (the web side won). done(null) = "not an answer".
+   * ponytail: pi's hideOverlay() pops the TOPMOST overlay — if the user stacked
+   * another overlay over ours, it gets popped instead (same structure as the
+   * rpiv-ask-user-question overlay; no per-overlay close API exists).
+   */
+  close(): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.tui.requestRender();
+    this.done(null);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Pages (spec §6). No backticks / ${...} inside page JS — they nest in
 // template literals below.
@@ -218,6 +492,24 @@ details.tool pre{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;color
 footer{display:flex;gap:8px;padding:10px 12px;background:var(--panel);border-top:1px solid #333}
 footer textarea{flex:1;resize:none;height:56px;background:#111;color:var(--text);border:1px solid #444;border-radius:8px;padding:8px;font:inherit}
 footer button{background:var(--user);color:#fff;border:0;border-radius:8px;padding:0 16px;cursor:pointer;font:inherit}
+#askmask{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:50;display:none;align-items:flex-end;justify-content:center}
+#askmask.open{display:flex}
+.askbox{background:var(--panel);border:1px solid #444;border-radius:12px;width:100%;max-width:640px;max-height:85vh;overflow-y:auto;padding:14px}
+.asktitle{font-size:13px;color:var(--dim);margin:0 0 10px}
+.askq{margin:12px 0;padding:10px;background:#161618;border:1px solid #2a2a30;border-radius:8px}
+.qchip{display:inline-block;background:#2a2a30;border-radius:4px;padding:1px 6px;font-size:11px;color:#9ca3af;margin-right:6px}
+.qtext{font-size:13px}
+.askopt{display:flex;gap:8px;align-items:flex-start;padding:4px 6px;border-radius:6px;cursor:pointer}
+.askopt:hover{background:#22222a}
+.askopt input{margin-top:3px}
+.olabel{font-size:13px}
+.odesc{font-size:12px;color:var(--dim)}
+.askcustom{margin-top:8px}
+.askcustom input{width:100%;background:#111;border:1px solid #444;color:var(--text);padding:6px;border-radius:6px;font:inherit}
+.askpreview{margin-top:6px;background:#0d0d0f;border:1px solid #333;border-radius:6px;padding:8px;white-space:pre-wrap;font-size:12px;color:#c8c8c8;max-height:180px;overflow-y:auto;display:none}
+.askbtns{display:flex;gap:8px;margin-top:12px}
+.askbtns button{flex:1;background:var(--user);color:#fff;border:0;border-radius:8px;padding:8px;cursor:pointer;font:inherit}
+.askbtns .askcancel{background:#374151}
 </style>
 </head>
 <body>
@@ -356,11 +648,16 @@ function renderEntry(en) {
       } else if (full) { addMsg('assistant', esc(full)); }
     } else if (m.role === 'toolResult') {
       var out = textOf(m.content);
+      // ask bridge: pi flags blocked calls isError, but an answered/declined
+      // questionnaire reads as a normal result, so don't style it as an error
+      var askOk = m.toolName === 'ask_user_question' &&
+        (out.indexOf('User has answered') === 0 || out.indexOf('User declined') === 0);
+      var shownErr = m.isError && !askOk;
       var el2 = document.getElementById('call-' + m.toolCallId);
       if (el2) {
         var s = el2.querySelector('summary');
-        if (s) s.textContent = m.toolName + ' — ' + (m.isError ? 'error' : 'done');
-        el2.classList.toggle('err', !!m.isError);
+        if (s) s.textContent = m.toolName + ' — ' + (shownErr ? 'error' : 'done');
+        el2.classList.toggle('err', shownErr);
         if (!el2.querySelector('pre.out')) {
           var pre2 = document.createElement('pre');
           pre2.className = 'out';
@@ -369,8 +666,8 @@ function renderEntry(en) {
         }
       } else {
         var el3 = document.createElement('details');
-        el3.className = 'tool' + (m.isError ? ' err' : '');
-        el3.innerHTML = '<summary>' + esc(m.toolName) + ' — ' + (m.isError ? 'error' : 'done') + '</summary>';
+        el3.className = 'tool' + (shownErr ? ' err' : '');
+        el3.innerHTML = '<summary>' + esc(m.toolName) + ' — ' + (shownErr ? 'error' : 'done') + '</summary>';
         var pre3 = document.createElement('pre');
         pre3.textContent = out;
         el3.appendChild(pre3);
@@ -407,7 +704,7 @@ function renderSnapshot(d) {
 }
 
 var es = new EventSource('/events');
-es.addEventListener('snapshot', function (e) { renderSnapshot(JSON.parse(e.data)); });
+es.addEventListener('snapshot', function (e) { hideAsk(); renderSnapshot(JSON.parse(e.data)); }); // a resync means the old session (and any pending ask of it) is gone
 es.addEventListener('resync', function (e) { renderSnapshot(JSON.parse(e.data)); });
 es.addEventListener('update', function (e) {
   var m = JSON.parse(e.data);
@@ -434,6 +731,166 @@ es.addEventListener('meta', function (e) {
   updateMetaLine();
 });
 es.addEventListener('note', function (e) { addNote(JSON.parse(e.data).text || ''); });
+
+// --- ask_user_question bridge: modal over the chat, answers POST /ask-answer ---
+var askMask = document.createElement('div');
+askMask.id = 'askmask';
+document.body.appendChild(askMask);
+var askState = null;
+
+function hideAsk() {
+  askState = null;
+  askMask.classList.remove('open');
+  askMask.innerHTML = '';
+}
+function mkAskQ(q, i) {
+  var box = document.createElement('div');
+  box.className = 'askq';
+  var head = document.createElement('div');
+  var chip = document.createElement('span');
+  chip.className = 'qchip';
+  chip.textContent = q.header || ('Q' + (i + 1));
+  head.appendChild(chip);
+  var qt = document.createElement('span');
+  qt.className = 'qtext';
+  qt.textContent = ' ' + q.question;
+  head.appendChild(qt);
+  box.appendChild(head);
+  var type = q.multiSelect ? 'checkbox' : 'radio';
+  var hasPreview = !q.multiSelect && q.options.some(function (o) { return o.preview; });
+  q.options.forEach(function (o, j) {
+    var row = document.createElement('label');
+    row.className = 'askopt';
+    var inp = document.createElement('input');
+    inp.type = type;
+    inp.name = 'askq' + i;
+    inp.value = o.label;
+    row.appendChild(inp);
+    var texts = document.createElement('span');
+    var lb = document.createElement('div');
+    lb.className = 'olabel';
+    lb.textContent = o.label;
+    texts.appendChild(lb);
+    if (o.description) {
+      var ds = document.createElement('div');
+      ds.className = 'odesc';
+      ds.textContent = o.description;
+      texts.appendChild(ds);
+    }
+    row.appendChild(texts);
+    box.appendChild(row);
+    if (hasPreview && o.preview) {
+      var pv = document.createElement('div');
+      pv.className = 'askpreview';
+      pv.id = 'askpv' + i + '_' + j;
+      pv.textContent = o.preview;
+      box.appendChild(pv);
+    }
+  });
+  if (hasPreview) {
+    var inputs = box.querySelectorAll('input[name=askq' + i + ']');
+    for (var k = 0; k < inputs.length; k++) {
+      (function (kk) {
+        inputs[kk].addEventListener('change', function () {
+          for (var x = 0; x < inputs.length; x++) {
+            var pvx = document.getElementById('askpv' + i + '_' + x);
+            if (pvx) pvx.style.display = inputs[x].checked ? 'block' : 'none';
+          }
+        });
+      })(k);
+    }
+  }
+  var cbox = document.createElement('div');
+  cbox.className = 'askcustom';
+  var clab = document.createElement('div');
+  clab.className = 'odesc';
+  clab.textContent = 'Type something.';
+  cbox.appendChild(clab);
+  var cin = document.createElement('input');
+  cin.type = 'text';
+  cin.id = 'askc' + i;
+  cin.placeholder = 'Your own answer...';
+  cbox.appendChild(cin);
+  box.appendChild(cbox);
+  var nbox = document.createElement('div');
+  nbox.className = 'askcustom';
+  var nlab = document.createElement('div');
+  nlab.className = 'odesc';
+  nlab.textContent = 'Note (optional)';
+  nbox.appendChild(nlab);
+  var nin = document.createElement('input');
+  nin.type = 'text';
+  nin.id = 'askn' + i;
+  nin.placeholder = 'Extra context for the agent...';
+  nbox.appendChild(nin);
+  box.appendChild(nbox);
+  return box;
+}
+function showAsk(d) {
+  hideAsk();
+  askState = { id: d.id, questions: Array.isArray(d.questions) ? d.questions : [] };
+  var box = document.createElement('div');
+  box.className = 'askbox';
+  var title = document.createElement('div');
+  title.className = 'asktitle';
+  title.textContent = 'The agent is asking — answer here (or in the terminal); first answer wins';
+  box.appendChild(title);
+  askState.questions.forEach(function (q, i) { box.appendChild(mkAskQ(q, i)); });
+  var btns = document.createElement('div');
+  btns.className = 'askbtns';
+  var sub = document.createElement('button');
+  sub.textContent = 'Submit answers';
+  sub.addEventListener('click', function () { submitAsk(false); });
+  var can = document.createElement('button');
+  can.className = 'askcancel';
+  can.textContent = 'Decline';
+  can.addEventListener('click', function () { submitAsk(true); });
+  btns.appendChild(sub);
+  btns.appendChild(can);
+  box.appendChild(btns);
+  askMask.appendChild(box);
+  askMask.classList.add('open');
+}
+function collectAsk() {
+  var answers = [];
+  (askState ? askState.questions : []).forEach(function (q, i) {
+    var customEl = document.getElementById('askc' + i);
+    var noteEl = document.getElementById('askn' + i);
+    var custom = customEl ? customEl.value.trim() : '';
+    var note = noteEl ? noteEl.value.trim() : '';
+    var a = null;
+    if (custom.length > 0) {
+      a = { index: i, kind: 'custom', answer: custom };
+    } else if (q.multiSelect) {
+      var sel = [];
+      var inputs = askMask.querySelectorAll('input[name=askq' + i + ']');
+      for (var k = 0; k < inputs.length; k++) if (inputs[k].checked) sel.push(inputs[k].value);
+      a = { index: i, kind: 'multi', answer: null, selected: sel };
+    } else {
+      var r = askMask.querySelector('input[name=askq' + i + ']:checked');
+      if (r) a = { index: i, kind: 'option', answer: r.value };
+    }
+    if (a && note.length > 0) a.notes = note;
+    if (a) answers.push(a);
+  });
+  return answers;
+}
+function submitAsk(cancelled) {
+  if (!askState) return;
+  var id = askState.id;
+  var answers = cancelled ? [] : collectAsk();
+  hideAsk();
+  fetch('/ask-answer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: id, cancelled: cancelled, answers: answers })
+  }).catch(function () { /* server gone; the terminal side still has the question */ });
+}
+es.addEventListener('ask', function (e) { showAsk(JSON.parse(e.data)); });
+es.addEventListener('ask-resolved', function (e) {
+  var d = JSON.parse(e.data);
+  if (askState && d.id === askState.id) hideAsk();
+});
 
 function send() {
   var t = input.value.trim();
@@ -496,6 +953,17 @@ export interface WebServer {
   resyncAll(): void;
   /** Session leaf moved: per-client append / resync (spec §5 change-detection). */
   onSessionChanged(newLeaf: string | null): void;
+  /** Currently connected SSE clients (0 = nobody is watching from the web). */
+  clientCount(): number;
+  /**
+   * Ask for answers over SSE: broadcasts `ask {id, questions}` and resolves
+   * when `POST /ask-answer` matches `id` — or null when the server stops,
+   * all clients leave, or `signal` aborts first (whichever the caller should
+   * fall back from). First answer wins; later posts for the same id get 409.
+   */
+  askUser(id: string, questions: AskQuestion[], signal?: AbortSignal): Promise<AskOutcome | null>;
+  /** Resolve a pending askUser outside the HTTP path (closes the web modal). */
+  settleAsk(id: string, outcome: AskOutcome | null): boolean;
 }
 
 interface SseClient {
@@ -563,8 +1031,49 @@ export function startServer(opts: {
 }): Promise<WebServer> {
   const { passwordHash, tokens, api } = opts;
   const clients = new Set<SseClient>();
+  const askWaiters = new Map<string, (o: AskOutcome | null) => void>();
   let closed = false;
   const server = http.createServer((req, res) => { void handle(req, res); });
+
+  function settleAsk(id: string, outcome: AskOutcome | null): boolean {
+    const w = askWaiters.get(id);
+    if (!w) return false;
+    askWaiters.delete(id);
+    broadcast("ask-resolved", { id, outcome });
+    w(outcome);
+    return true;
+  }
+
+  function broadcast(name: string, data: unknown): void {
+    if (closed) return;
+    for (const c of [...clients]) {
+      if (!writeSse(c.res, name, data)) c.res.end();
+    }
+  }
+
+  // Last client left while a question was pending: nobody on the web can
+  // answer anymore — wake the waiter (null) so the terminal side can finish alone.
+  function checkAskOnLeave(): void {
+    if (clients.size === 0) for (const id of [...askWaiters.keys()]) settleAsk(id, null);
+  }
+
+  function askUser(id: string, questions: AskQuestion[], signal?: AbortSignal): Promise<AskOutcome | null> {
+    if (closed || clients.size === 0) return Promise.resolve(null);
+    let onAbort: (() => void) | undefined;
+    const p = new Promise<AskOutcome | null>((resolve) => {
+      const finish = (o: AskOutcome | null) => {
+        if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+        resolve(o);
+      };
+      const prev = askWaiters.get(id);
+      if (prev) prev(null); // duplicate hook invocation: settle the stale waiter so the old await can't hang
+      askWaiters.set(id, finish);
+      onAbort = () => { settleAsk(id, null); };
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    });
+    broadcast("ask", { id, questions });
+    return p;
+  }
 
   function openSse(res: http.ServerResponse): void {
     res.writeHead(200, {
@@ -581,7 +1090,7 @@ export function startServer(opts: {
       lastLeaf: snap.meta.leafId,
     };
     clients.add(client);
-    res.on("close", () => { clearInterval(client.hb); clients.delete(client); });
+    res.on("close", () => { clearInterval(client.hb); clients.delete(client); checkAskOnLeave(); });
   }
 
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -626,6 +1135,39 @@ export function startServer(opts: {
         json(res, 200, api.stopAgent());
         return;
       }
+      if (req.method === "POST" && url === "/ask-answer") {
+        const raw = await readBody(req, BODY_LIMIT);
+        const body = parseJsonBody(raw);
+        if (!body || typeof body.id !== "string" || (body.id as string).length > 200) {
+          json(res, 400, { error: "bad request" });
+          return;
+        }
+        const cancelled = body.cancelled === true;
+        const answers: AskAnswer[] = [];
+        if (!cancelled) {
+          const rawAnswers = Array.isArray(body.answers) ? body.answers : [];
+          for (const a of rawAnswers) {
+            if (!a || typeof (a as AnyRec).index !== "number") continue;
+            const kind = (a as AnyRec).kind;
+            if (kind !== "option" && kind !== "custom" && kind !== "multi") continue;
+            const out: AskAnswer = { index: (a as AnyRec).index as number, kind: kind as AskAnswer["kind"] };
+            const ans = (a as AnyRec).answer;
+            out.answer = typeof ans === "string" ? ans.slice(0, 8000) : null;
+            if (Array.isArray((a as AnyRec).selected)) {
+              out.selected = ((a as AnyRec).selected as unknown[])
+                .filter((x): x is string => typeof x === "string")
+                .slice(0, 10)
+                .map((s) => s.slice(0, 200));
+            }
+            const notes = (a as AnyRec).notes;
+            if (typeof notes === "string" && notes.length > 0) out.notes = notes.slice(0, 2000);
+            answers.push(out);
+          }
+        }
+        const ok = settleAsk(body.id as string, { cancelled, answers });
+        json(res, ok ? 200 : 409, ok ? { ok: true } : { error: "no pending question" });
+        return;
+      }
       if (req.method === "POST" && url === "/logout") {
         if (token) tokens.delete(token);
         json(res, 200, { ok: true }, { "Set-Cookie": clearCookieHeader() });
@@ -645,17 +1187,13 @@ export function startServer(opts: {
     port: opts.port,
     stop() {
       closed = true;
+      for (const id of [...askWaiters.keys()]) settleAsk(id, null);
       const cs = [...clients];
       clients.clear();
       for (const c of cs) { clearInterval(c.hb); c.res.end(); }
       server.close();
     },
-    broadcast(name, data) {
-      if (closed) return;
-      for (const c of [...clients]) {
-        if (!writeSse(c.res, name, data)) c.res.end();
-      }
-    },
+    broadcast: (name, data) => broadcast(name, data),
     resyncAll() {
       if (closed) return;
       for (const c of [...clients]) {
@@ -690,6 +1228,11 @@ export function startServer(opts: {
         if (c.res.writableEnded || c.res.destroyed) c.res.end();
       }
     },
+    clientCount() {
+      return clients.size;
+    },
+    askUser,
+    settleAsk,
   };
 
   return new Promise<WebServer>((resolve, reject) => {
@@ -859,6 +1402,71 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_info_changed", (_e, ctx) => { curCtx = ctx; changed(); });
   pi.on("agent_start", (_e, ctx) => { curCtx = ctx; server?.broadcast("status", { busy: true }); });
   pi.on("agent_settled", (_e, ctx) => { curCtx = ctx; server?.broadcast("status", { busy: false }); server?.broadcast("meta", { usage: ctx.getContextUsage() ?? null }); });
+
+  // --- ask_user_question bridge: web + terminal, first answer wins ---
+  // The rpiv-ask-user-question tool would otherwise block on a TUI overlay in
+  // the local terminal only. When a web client is watching, we answer the
+  // call from the web modal and/or a minimal terminal overlay (this hook runs
+  // before the tool executes; a returned {block} becomes the tool result the
+  // model sees — we use the tool's own result wording so behavior is
+  // indistinguishable). No web client -> return undefined -> the tool's own
+  // rich TUI flow runs exactly as before.
+  pi.on("tool_call", async (event, ctx) => {
+    if (event.toolName !== "ask_user_question") return;
+    const questions = extractAskQuestions((event.input as AnyRec).questions);
+    if (!questions) return; // malformed: the tool's own validation reports it
+    if (questions.some((q) => q.options.some((o) => ASK_RESERVED_LABELS.includes(o.label)))) {
+      return; // reserved label: the tool's own validator rejects it
+    }
+    if (!server || server.clientCount() === 0) return; // nobody on the web: TUI as usual
+    const id = event.toolCallId;
+
+    // Web side: modal in every connected client; first POST /ask-answer wins.
+    const webSide = server.askUser(id, questions, ctx.signal);
+    // Terminal side: our own closable overlay (only when this pi has a TUI).
+    let closeTui: (() => void) | null = null;
+    let termSide: Promise<AskOutcome | null> | null = null;
+    if (ctx.hasUI && ctx.mode === "tui") {
+      let comp: AskTuiComponent | null = null;
+      termSide = ctx.ui.custom<AskOutcome | null>(
+        (tui, _theme, _kb, done) => {
+          comp = new AskTuiComponent(questions, tui, done);
+          closeTui = () => comp?.close();
+          if (ctx.signal) ctx.signal.addEventListener("abort", closeTui, { once: true }); // don't leave a stuck overlay on Esc
+          return comp;
+        },
+        {
+          overlay: true,
+          overlayOptions: { anchor: "bottom-center", width: "100%" },
+        },
+      ).then((r) => r ?? null).catch(() => null);
+    }
+    const sides = termSide ? [webSide, termSide] : [webSide];
+
+    // First real answer wins; a null side means that surface died (all clients
+    // left / server stopped / host can't render / closed by the other side),
+    // so keep waiting for the rest. All dead -> undefined -> the tool's own flow.
+    const outcome = await new Promise<AskOutcome | null>((resolve) => {
+      let pending = sides.length;
+      let done = false;
+      for (const s of sides) {
+        void s.then((o) => {
+          if (done) return;
+          if (o) {
+            done = true;
+            closeTui?.(); // terminal loses: hide the overlay (done(null))
+            server?.settleAsk(id, null); // web loses: close the modal (broadcasts ask-resolved)
+            resolve(o);
+          } else if (--pending === 0) {
+            done = true;
+            resolve(null);
+          }
+        });
+      }
+    });
+    if (!outcome) return;
+    return { block: true, reason: buildAskEnvelope(questions, outcome) };
+  });
 
   // --- web-side equivalents of built-in commands ---
   // Same names as the TUI built-ins: in the terminal pi checks the built-ins

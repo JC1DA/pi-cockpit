@@ -3,7 +3,7 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { hashPassword, verifyPassword, issueToken, cookieHeader, clearCookieHeader, tokenFromCookie, sanitizeEntry, diffLeaf, inputOpts, startServer, default as piCockpit, type AnyRec, LOGIN_PAGE, CHAT_PAGE } from "./index.ts";
+import { hashPassword, verifyPassword, issueToken, cookieHeader, clearCookieHeader, tokenFromCookie, sanitizeEntry, diffLeaf, inputOpts, startServer, default as piCockpit, type AnyRec, LOGIN_PAGE, CHAT_PAGE, buildAskEnvelope, extractAskQuestions, AskTuiComponent, ASK_RESERVED_LABELS, type AskQuestion, type AskOutcome } from "./index.ts";
 
 let failed = 0, passed = 0;
 function check(name: string, cond: boolean): void {
@@ -133,6 +133,100 @@ function check(name: string, cond: boolean): void {
   const el2 = metaSegSrc && upMetaSrc ? runMeta({ sessionName: null, model: "", cwd: "/w", usage: null }) : null;
   check("page: meta line omits usage segment when absent",
     !!el2 && el2.children.length === 3 && el2.children[0].textContent === "pi session");
+}
+
+// ---------- ask_user_question bridge: envelope + extractor ----------
+{
+  const qs: AskQuestion[] = [
+    { question: "Which library?", header: "Library", options: [{ label: "A", description: "da" }, { label: "B", description: "db" }] },
+    { question: "Which features?", header: "Scope", multiSelect: true, options: [{ label: "X", description: "" }, { label: "Y", description: "" }] },
+  ];
+  const full = buildAskEnvelope(qs, {
+    cancelled: false,
+    answers: [
+      { index: 0, kind: "option", answer: "A" },
+      { index: 1, kind: "multi", selected: ["X", "Y"] },
+    ],
+  });
+  check("ask envelope: exact rpiv wording for option + multi",
+    full === 'User has answered your questions: "Which library?"="A". "Which features?"="X, Y". You can now continue with the user\'s answers in mind.');
+  check("ask envelope: cancelled -> canonical decline",
+    buildAskEnvelope(qs, { cancelled: true, answers: [] }) === "User declined to answer questions");
+  check("ask envelope: unanswered -> canonical decline",
+    buildAskEnvelope(qs, { cancelled: false, answers: [] }) === "User declined to answer questions");
+  check("ask envelope: partial (unanswered contributes no segment)",
+    buildAskEnvelope(qs, { cancelled: false, answers: [{ index: 0, kind: "option", answer: "B" }] }) ===
+    'User has answered your questions: "Which library?"="B". You can now continue with the user\'s answers in mind.');
+  check("ask envelope: custom text + user notes",
+    buildAskEnvelope([qs[0]], { cancelled: false, answers: [{ index: 0, kind: "custom", answer: "my own words", notes: "because" }] }) ===
+    'User has answered your questions: "Which library?"="my own words". user notes: because. You can now continue with the user\'s answers in mind.');
+  check("ask envelope: empty custom/multi -> (no input)",
+    buildAskEnvelope([qs[0], qs[1]], { cancelled: false, answers: [{ index: 0, kind: "custom", answer: null }, { index: 1, kind: "multi", selected: [] }] }) ===
+    'User has answered your questions: "Which library?"="(no input)". "Which features?"="(no input)". You can now continue with the user\'s answers in mind.');
+
+  const good = [{ question: "Q?", options: [{ label: "a", description: "" }, { label: "b", description: "" }] }];
+  check("ask extract: valid input normalizes",
+    (extractAskQuestions(good) as AskQuestion[])[0].options.length === 2);
+  check("ask extract: preview capped at 2000",
+    (extractAskQuestions([{ question: "Q?", options: [{ label: "a", description: "", preview: "x".repeat(5000) }, { label: "b", description: "" }] }]) as AskQuestion[])[0].options[0].preview?.length === 2000);
+  check("ask extract: malformed -> null",
+    extractAskQuestions(null) === null &&
+    extractAskQuestions([]) === null &&
+    extractAskQuestions([{ question: "Q?" }]) === null &&
+    extractAskQuestions([{ question: "Q?", options: [{ label: "a" }] }]) === null &&
+    extractAskQuestions([{ question: 5, options: [{ label: "a", description: "" }, { label: "b", description: "" }] }]) === null);
+  check("ask reserved labels list", JSON.stringify(ASK_RESERVED_LABELS) === '["Other","Type something.","Next"]');
+}
+
+// ---------- ask bridge: terminal questionnaire component ----------
+{
+  const fakeTui = { requestRender(): void { /* noop */ } };
+  const two: AskQuestion[] = [{ question: "Which option?", options: [{ label: "A", description: "da" }, { label: "B", description: "db" }] }];
+
+  let result: AskOutcome | null | undefined;
+  const c1 = new AskTuiComponent(two, fakeTui, (o) => { result = o; });
+  const lines = c1.render(80);
+  check("ask tui: renders boxed questionnaire with both options",
+    lines[0].codePointAt(0) === 0x250c && lines[lines.length - 1].codePointAt(0) === 0x2514 &&
+    lines.some((l) => l.includes("1. A")) && lines.some((l) => l.includes("2. B")) &&
+    lines.some((l) => l.includes("Type something.")));
+  c1.handleInput("\u001b[B"); // down
+  check("ask tui: down moves cursor", c1.render(80).some((l) => />\s+2\. B/.test(l)));
+  c1.handleInput("\r"); // enter
+  check("ask tui: enter picks option -> answered outcome",
+    !!result && !result.cancelled && result.answers.length === 1 &&
+    result.answers[0].kind === "option" && result.answers[0].answer === "B");
+
+  let r2: AskOutcome | null | undefined;
+  const c2 = new AskTuiComponent(two, fakeTui, (o) => { r2 = o; });
+  c2.handleInput("\u001b"); // esc
+  check("ask tui: esc cancels the whole questionnaire",
+    !!r2 && r2.cancelled === true && r2.answers.length === 0);
+
+  let r3: AskOutcome | null | undefined;
+  const c3 = new AskTuiComponent(two, fakeTui, (o) => { r3 = o; });
+  c3.handleInput("\u001b[B"); c3.handleInput("\u001b[B"); // down x2 -> Type something. row
+  c3.handleInput("\r"); // enter -> typing mode
+  c3.handleInput("h"); c3.handleInput(" "); c3.handleInput("i"); c3.handleInput("\x7f"); c3.handleInput("y"); // "h y" — space must survive
+  check("ask tui: typing mode edits the draft (space + backspace honored)", c3.render(80).some((l) => l.includes("> h y")));
+  c3.handleInput("\r"); // enter -> commit custom
+  check("ask tui: custom answer committed (with space)",
+    !!r3 && !r3.cancelled && r3.answers[0].kind === "custom" && r3.answers[0].answer === "h y");
+
+  const multi: AskQuestion[] = [{ question: "Pick some?", multiSelect: true, options: [{ label: "X", description: "" }, { label: "Y", description: "" }] }];
+  let r4: AskOutcome | null | undefined;
+  const c4 = new AskTuiComponent(multi, fakeTui, (o) => { r4 = o; });
+  c4.handleInput(" "); // toggle 1
+  c4.handleInput("\u001b[B"); // down
+  c4.handleInput(" "); // toggle 2
+  c4.handleInput("\r"); // enter -> advance
+  check("ask tui: multi-select toggles + enter commits selection",
+    !!r4 && !r4.cancelled && r4.answers[0].kind === "multi" && JSON.stringify(r4.answers[0].selected) === '["X","Y"]');
+
+  let r5: AskOutcome | null | undefined;
+  const c5 = new AskTuiComponent(two, fakeTui, (o) => { r5 = o; });
+  c5.close();
+  check("ask tui: close() signals no-answer (web side won)", r5 === null);
 }
 
 // ---------- http server (fake pi api) ----------
@@ -310,6 +404,73 @@ async function sseTests(): Promise<void> {
 
 await sseTests();
 
+// ---------- ask bridge: server-side askUser ----------
+async function askServerTests(): Promise<void> {
+  const api = {
+    getSnapshot: () => ({
+      entries: [] as AnyRec[],
+      meta: { cwd: "/tmp", model: "p/m", sessionName: null, leafId: null, usage: null },
+    }),
+    allEntries: () => new Map<string, AnyRec>(),
+    sendInput: async () => ({ queued: false }),
+    stopAgent: () => ({ aborted: false }),
+  };
+  const ws = await startServer({ host: "127.0.0.1", port: 0, passwordHash: hashPassword("testpw123"), tokens: new Set<string>(), api });
+  const base = "http://127.0.0.1:" + ws.port;
+  const qs: AskQuestion[] = [{ question: "Q?", options: [{ label: "A", description: "" }, { label: "B", description: "" }] }];
+
+  check("ask server: clientCount starts at 0", ws.clientCount() === 0);
+  check("ask server: askUser with no client resolves null", (await ws.askUser("n1", qs)) === null);
+
+  const login = await fetch(base + "/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: "testpw123" }) });
+  const cookie = (login.headers.get("set-cookie") ?? "").split(";")[0];
+  const client = await new Promise<{ get: () => string; close: () => void }>((resolve, reject) => {
+    const chunks: string[] = [];
+    const req = http.get(base + "/events", { headers: { cookie } }, (res) => {
+      res.on("data", (c: Buffer) => chunks.push(c.toString()));
+      resolve({ get: () => chunks.join(""), close: () => req.destroy() });
+    });
+    req.on("error", reject);
+  });
+  const waitUntil = (needle: string, ms = 3000): Promise<void> => new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    const t = setInterval(() => {
+      if (client.get().includes(needle)) { clearInterval(t); resolve(); }
+      else if (Date.now() - t0 > ms) { clearInterval(t); reject(new Error("timeout: " + needle)); }
+    }, 20);
+  });
+
+  try {
+    check("ask server: clientCount 1 with a connected client", ws.clientCount() === 1);
+    const p = ws.askUser("a1", qs);
+    await waitUntil("event: ask");
+    check("ask server: ask broadcast reaches the client with id + questions",
+      client.get().includes('"id":"a1"') && client.get().includes('"question":"Q?"'));
+    const r = await fetch(base + "/ask-answer", { method: "POST", headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ id: "a1", cancelled: false, answers: [{ index: 0, kind: "option", answer: "B" }] }) });
+    check("ask server: /ask-answer -> 200", r.status === 200);
+    const outcome = await p;
+    check("ask server: askUser resolves with the posted answer",
+      !!outcome && !outcome.cancelled && outcome.answers.length === 1 && outcome.answers[0].answer === "B");
+    await waitUntil("ask-resolved");
+    check("ask server: ask-resolved broadcast closes client modals", client.get().includes('"id":"a1"'));
+    const dup = await fetch(base + "/ask-answer", { method: "POST", headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ id: "a1", cancelled: false, answers: [{ index: 0, kind: "option", answer: "B" }] }) });
+    check("ask server: duplicate /ask-answer -> 409", dup.status === 409);
+    const bad = await fetch(base + "/ask-answer", { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: "{nope" });
+    check("ask server: bad json /ask-answer -> 400", bad.status === 400);
+
+    const p2 = ws.askUser("a2", qs);
+    client.close();
+    check("ask server: last client leaving resolves pending ask with null", (await p2) === null);
+  } finally {
+    client.close();
+    ws.stop();
+  }
+}
+
+await askServerTests();
+
 // ---------- pi wiring: session replacement keeps the running server ----------
 // pi re-invokes the extension factory with a fresh closure on every session
 // replacement and invalidates the old ctx; the fix under test is module-scope
@@ -326,6 +487,7 @@ async function wiringTests(): Promise<void> {
     return {
       commands,
       sent,
+      handlers,
       emit(event: string, e: unknown, ctx: unknown): void {
         for (const h of handlers.get(event) ?? []) h(e, ctx);
       },
@@ -340,18 +502,38 @@ async function wiringTests(): Promise<void> {
       } as unknown as Parameters<typeof piCockpit>[0],
     };
   };
+  type AskTestState = {
+    lastComp: null | { handleInput(d: string): void; close?(): void };
+    doneCalls: unknown[];
+    tuiTypes: boolean;
+  };
   const makeCtx = (entries: Record<string, unknown>[], leafId: string | null) => {
+    const usage: { tokens: number | null; contextWindow: number; percent: number | null } = { tokens: null, contextWindow: 200000, percent: null };
+    const ask: AskTestState = { lastComp: null, doneCalls: [], tuiTypes: false };
+    // Emulates pi's custom() plumbing: runs the factory, resolves the returned
+    // promise when the component's done() fires. tuiTypes simulates the local
+    // user picking option 2 +50ms later.
+    const fakeTui = { requestRender(): void {} };
     const ui = {
       notes: [] as string[],
       passwords: ["testpw123"],
       notify(msg: string, kind: string): void { this.notes.push(kind + ": " + msg); },
       input(): Promise<string | undefined> { return Promise.resolve(this.passwords.shift()); },
       setStatus(): void {},
+      custom(factory: (t: unknown, th: unknown, kb: unknown, d: (r: unknown) => void) => AskTestState["lastComp"], _opts?: unknown): Promise<unknown> {
+        let resolveFn!: (r: unknown) => void;
+        const p = new Promise<unknown>((res) => { resolveFn = res; });
+        const done = (o: unknown) => { ask.doneCalls.push(o); resolveFn(o); };
+        const comp = factory(fakeTui, {}, {}, done);
+        ask.lastComp = comp;
+        if (ask.tuiTypes) setTimeout(() => { comp?.handleInput("\u001b[B"); comp?.handleInput("\r"); }, 50);
+        return p;
+      },
     };
-    const usage: { tokens: number | null; contextWindow: number; percent: number | null } = { tokens: null, contextWindow: 200000, percent: null };
     return {
       ui,
       usage,
+      ask,
       ctx: {
         ui,
         sessionManager: {
@@ -362,6 +544,9 @@ async function wiringTests(): Promise<void> {
           getLeafId: () => leafId,
         },
         model: undefined,
+        hasUI: true,
+        mode: "tui",
+        signal: undefined,
         isIdle: () => true,
         abort(): void {},
         compact(): void {},
@@ -504,6 +689,98 @@ async function wiringTests(): Promise<void> {
 
     fake3.emit("session_shutdown", { type: "session_shutdown", reason: "resume", targetSessionFile: path.join(tmp, "same.jsonl") }, c3.ctx);
     check("wiring: same-cwd /resume keeps the server", await up());
+
+    // pi starts the resumed session right after shutdown: the new closure's
+    // session_start rebinds curCtx (without it getSnapshot throws NO_CTX and
+    // SSE clients can never connect — exactly what the real runtime does)
+    c3 = makeCtx([{
+      type: "message", id: "e3", parentId: null, timestamp: "1",
+      message: { role: "user", content: "three" },
+    }], "e3");
+    fake3.emit("session_start", { type: "session_start", reason: "resume" }, c3.ctx);
+    // --- phase 3: ask bridge (tool_call hook; web + terminal, first wins) ---
+    const askEvent = (id: string) => ({
+      type: "tool_call",
+      toolName: "ask_user_question",
+      toolCallId: id,
+      input: {
+        questions: [{
+          question: "Which option?",
+          header: "Choice",
+          options: [{ label: "A", description: "da" }, { label: "B", description: "db" }],
+        }],
+      },
+    });
+    const toolCallHandler = (fake3 as unknown as { handlers: Map<string, Array<(e: unknown, ctx: unknown) => unknown>> }).handlers.get("tool_call")?.[0];
+    check("wiring: ask tool_call handler registered", !!toolCallHandler);
+    if (toolCallHandler) {
+      // (a) no web client connected yet -> hook stays out of the way
+      const r1 = await toolCallHandler(askEvent("tc-a"), c3.ctx) as { block?: boolean; reason?: string } | undefined;
+      check("wiring: ask with no web client -> undefined (tool's own TUI flow)", r1 === undefined);
+
+      const login3 = await fetch(base3 + "/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: "testpw123" }) });
+      const cookie3 = (login3.headers.get("set-cookie") ?? "").split(";")[0];
+      const sse3 = await new Promise<{ get: () => string; close: () => void }>((resolve, reject) => {
+        const chunks: string[] = [];
+        const req = http.get(base3 + "/events", { headers: { cookie: cookie3 } }, (res) => {
+          res.on("data", (c: Buffer) => chunks.push(c.toString()));
+          resolve({ get: () => chunks.join(""), close: () => req.destroy() });
+        });
+        req.on("error", reject);
+      });
+      const waitIn3 = (needle: string, ms = 3000): Promise<void> => new Promise((resolve, reject) => {
+        const t0 = Date.now();
+        const t = setInterval(() => {
+          if (sse3.get().includes(needle)) { clearInterval(t); resolve(); }
+          else if (Date.now() - t0 > ms) { clearInterval(t); reject(new Error("timeout waiting for: " + needle)); }
+        }, 20);
+      });
+      const envelope = (answer: string) =>
+        'User has answered your questions: "Which option?"="' + answer + '". You can now continue with the user\'s answers in mind.';
+
+      // (b) web client present, terminal user answers first -> terminal wins
+      c3.ask.tuiTypes = true;
+      const r2 = await toolCallHandler(askEvent("tc-b"), c3.ctx) as { block?: boolean; reason?: string } | undefined;
+      check("wiring: terminal answer wins -> block with rpiv-style envelope",
+        r2?.block === true && r2.reason === envelope("B"));
+      await waitIn3("ask-resolved");
+      check("wiring: web modal closed when terminal wins (ask-resolved broadcast)",
+        sse3.get().includes("ask-resolved") && sse3.get().includes('"id":"tc-b"'));
+
+      // (c) web client answers first -> web wins, terminal overlay closed
+      c3.ask.tuiTypes = true; // would type at +50ms, after the web POST
+      const p3 = toolCallHandler(askEvent("tc-c"), c3.ctx) as Promise<{ block?: boolean; reason?: string } | undefined>;
+      await waitIn3('"id":"tc-c"');
+      const ans = await fetch(base3 + "/ask-answer", { method: "POST", headers: { "Content-Type": "application/json", cookie: cookie3 },
+        body: JSON.stringify({ id: "tc-c", cancelled: false, answers: [{ index: 0, kind: "option", answer: "A" }] }) });
+      check("wiring: /ask-answer accepted -> 200", ans.status === 200);
+      const r3 = await p3;
+      check("wiring: web answer wins -> block with that envelope",
+        r3?.block === true && r3.reason === envelope("A"));
+      check("wiring: terminal overlay closed when web wins", c3.ask.doneCalls[c3.ask.doneCalls.length - 1] === null);
+
+      const dup = await fetch(base3 + "/ask-answer", { method: "POST", headers: { "Content-Type": "application/json", cookie: cookie3 },
+        body: JSON.stringify({ id: "tc-c", cancelled: false, answers: [{ index: 0, kind: "option", answer: "A" }] }) });
+      check("wiring: duplicate /ask-answer -> 409", dup.status === 409);
+
+      // (d) decline from the web
+      const p4 = toolCallHandler(askEvent("tc-d"), c3.ctx) as Promise<{ block?: boolean; reason?: string } | undefined>;
+      await waitIn3('"id":"tc-d"');
+      await fetch(base3 + "/ask-answer", { method: "POST", headers: { "Content-Type": "application/json", cookie: cookie3 },
+        body: JSON.stringify({ id: "tc-d", cancelled: true, answers: [] }) });
+      const r4 = await p4;
+      check("wiring: web decline -> block with canonical decline text",
+        r4?.block === true && r4.reason === "User declined to answer questions");
+
+      // (e) the only web client leaves mid-question -> terminal side still resolves it
+      const p5 = toolCallHandler(askEvent("tc-e"), c3.ctx) as Promise<{ block?: boolean; reason?: string } | undefined>;
+      await waitIn3('"id":"tc-e"');
+      sse3.close();
+      const r5 = await p5;
+      check("wiring: client left -> terminal answer still resolves the call",
+        r5?.block === true && r5.reason === envelope("B"));
+      sse3.close();
+    }
   } finally {
     if (fake3 && c3) { try { await fake3.commands.get("webserve")!.handler("stop", c3.ctx); } catch { /* ok */ } }
     await fs.promises.rm(tmp, { recursive: true, force: true });

@@ -1,8 +1,9 @@
 # pi-cockpit
 
 Stream your pi session to a web browser. Watch the agent work from another
-machine on your LAN, type messages back into it, and stop the run. One file,
-zero runtime dependencies.
+machine on your LAN, type messages back into it, stop the run, and answer the
+agent's questions. One file; the only non-node: import is pi's own bundled
+`pi-tui` (for the terminal-side question dialog).
 
 ## Install
 
@@ -37,6 +38,10 @@ in a browser, enter the password, and the session streams live:
   `/compact [instructions]` compacts the context (runs immediately, even
   while busy; results appear as notes in the view).
 - **Stop** in the header interrupts the run, exactly like Esc.
+- **Answer the agent's questions** — when the agent calls
+  `ask_user_question` (rpiv-ask-user-question) and a browser is open, the
+  questions appear in a web modal AND in the terminal; whichever answer lands
+  first wins, the other surface closes, and the agent continues with it.
 - The header shows session name, model, working directory, a busy indicator,
   and live context usage (`45k/200k (23%)`, same source as the terminal's
   `/context`; updates after each run and on model change). On narrow screens
@@ -61,10 +66,11 @@ gets its own server (8765, 8766, ...).
 
 ```bash
 npm install               # dev-only type deps
-node selftest.ts          # 71 checks: password, tokens, sanitizer, leaf diff,
+node selftest.ts          # 109 checks: password, tokens, sanitizer, leaf diff,
                           # input dispatch, page JS (incl. usage/meta formatting), HTTP protocol,
                           # live SSE, pi wiring (factory re-run across session replacement,
-                          # usage refresh, /resume cwd policy)
+                          # usage refresh, /resume cwd policy), ask bridge (envelope wording,
+                          # TUI component, HTTP ask flow, first-answer-wins hook wiring)
 npx tsc -p tsconfig.json  # strict type check
 ```
 
@@ -78,5 +84,3 @@ type stripping). For the manual browser e2e checklist, see `description.md`.
 | `index.ts` | the whole extension: helpers, pages, HTTP/SSE server, pi wiring |
 | `selftest.ts` | test suite, plain node with no framework |
 | `description.md` | user-facing reference and e2e checklist |
-| `docs/superpowers/specs/` | design spec |
-| `docs/superpowers/plans/` | implementation plan |
