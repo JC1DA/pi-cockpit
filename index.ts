@@ -5,13 +5,14 @@
  *   /webserve stop
  *   /webserve status
  *
- * Zero runtime dependencies: node:http + node:crypto + node:os only.
+ * Zero runtime dependencies: node:http + node:crypto + node:os + node:fs only.
  * The pi import below is type-only (erased at runtime).
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import http from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { networkInterfaces } from "node:os";
+import { closeSync, openSync, readSync } from "node:fs";
 
 export type AnyRec = Record<string, unknown>;
 
@@ -129,6 +130,16 @@ export function diffLeaf(
   }
   path.reverse();
   return { kind: "append", entries: path };
+}
+
+// Delivery options for user input (TUI parity). "/" input goes through pi's
+// dispatch: registered commands execute immediately (even while streaming),
+// skills/prompt templates expand; anything else queues as followUp while busy.
+export function inputOpts(text: string, idle: boolean): { deliverAs?: "followUp"; expandPromptTemplates?: boolean } {
+  return {
+    deliverAs: idle ? undefined : "followUp",
+    expandPromptTemplates: text.startsWith("/"),
+  };
 }
 // ---------------------------------------------------------------------------
 // Pages (spec §6). No backticks / ${...} inside page JS — they nest in
@@ -395,6 +406,7 @@ es.addEventListener('toolstart', function (e) {
 });
 es.addEventListener('status', function (e) { setBusy(!!JSON.parse(e.data).busy); });
 es.addEventListener('meta', function (e) { curMeta.model = JSON.parse(e.data).model || ''; updateMetaLine(); });
+es.addEventListener('note', function (e) { addNote(JSON.parse(e.data).text || ''); });
 
 function send() {
   var t = input.value.trim();
@@ -452,6 +464,8 @@ export interface WebServer {
   stop(): void;
   /** Push one SSE event to every authenticated, connected client. */
   broadcast(name: string, data: unknown): void;
+  /** Full resync to every client (session replaced: /new, /resume, ...). */
+  resyncAll(): void;
   /** Session leaf moved: per-client append / resync (spec §5 change-detection). */
   onSessionChanged(newLeaf: string | null): void;
 }
@@ -614,6 +628,16 @@ export function startServer(opts: {
         if (!writeSse(c.res, name, data)) c.res.end();
       }
     },
+    resyncAll() {
+      if (closed) return;
+      for (const c of [...clients]) {
+        let snap: { entries: AnyRec[]; meta: SnapshotMeta };
+        try { snap = api.getSnapshot(); }
+        catch { clearInterval(c.hb); c.res.end(); clients.delete(c); continue; }
+        writeSse(c.res, "resync", { entries: snap.entries, meta: snap.meta });
+        c.lastLeaf = snap.meta.leafId ?? null;
+      }
+    },
     onSessionChanged(newLeaf) {
       if (closed) return;
       const byId = api.allEntries();
@@ -651,8 +675,14 @@ export function startServer(opts: {
 }
 
 // ---------------------------------------------------------------------------
-// Pi wiring (spec §3–§4). Server state lives only in this closure:
-// in-memory, per session instance, never persisted (spec §7).
+// Pi wiring (spec §3–§4). Server state lives at MODULE scope (in-memory, per
+// pi process, never persisted): pi re-invokes the factory with a fresh closure
+// on every session replacement (/new, /resume, /fork, /reload), invalidates
+// the old pi/ctx (see AgentSession.dispose), but the module is imported once,
+// so only module-level state survives across invocations. Handlers in the new
+// closure rebind curCtx/curPi and resync the same running server — including
+// the server's api object, which must route sendInput through the CURRENT pi,
+// not the (invalidated) one captured when the server was started.
 // ---------------------------------------------------------------------------
 
 function lanUrls(port: number): string[] {
@@ -672,18 +702,39 @@ function noCtxError(): Error {
   return e;
 }
 
-export default function (pi: ExtensionAPI): void {
-  let server: WebServer | null = null;
-  let tokens = new Set<string>();
-  let passwordHash = "";
-  let curCtx: ExtensionContext | null = null;
+/**
+ * cwd from a session JSONL file's header line, or null if unreadable.
+ * Used to detect cross-cwd /resume targets (see session_shutdown below).
+ */
+function sessionFileCwd(file: string): string | null {
+  let fd: number | null = null;
+  try {
+    fd = openSync(file, "r");
+    const buf = Buffer.alloc(64 * 1024); // header entry is small; 64KB covers it
+    const n = readSync(fd, buf, 0, buf.length, 0);
+    const firstLine = buf.toString("utf8", 0, n).split("\n")[0].trim();
+    if (!firstLine) return null;
+    const head = JSON.parse(firstLine) as { cwd?: unknown };
+    return typeof head.cwd === "string" ? head.cwd : null;
+  } catch { return null; }
+  finally { if (fd !== null) closeSync(fd); }
+}
 
-  const stopServer = (): void => {
-    if (!server) return;
-    server.stop();
-    server = null;
-    if (curCtx) curCtx.ui.setStatus("webserve", undefined);
-  };
+let server: WebServer | null = null;
+let tokens = new Set<string>();
+let passwordHash = "";
+let curCtx: ExtensionContext | null = null;
+let curPi: ExtensionAPI | null = null;
+
+const stopServer = (): void => {
+  if (!server) return;
+  server.stop();
+  server = null;
+  if (curCtx) curCtx.ui.setStatus("webserve", undefined);
+};
+
+export default function (pi: ExtensionAPI): void {
+  curPi = pi;
 
   const api: WebApi = {
     getSnapshot() {
@@ -712,13 +763,11 @@ export default function (pi: ExtensionAPI): void {
     },
     async sendInput(text) {
       const ctx = curCtx;
-      if (!ctx) throw noCtxError();
-      if (ctx.isIdle()) {
-        pi.sendUserMessage(text);
-        return { queued: false };
-      }
-      pi.sendUserMessage(text, { deliverAs: "followUp" });
-      return { queued: true };
+      const p = curPi;
+      if (!ctx || !p) throw noCtxError();
+      const idle = ctx.isIdle();
+      p.sendUserMessage(text, inputOpts(text, idle));
+      return { queued: !idle };
     },
     stopAgent() {
       const ctx = curCtx;
@@ -732,10 +781,26 @@ export default function (pi: ExtensionAPI): void {
   const changed = (): void => { server?.onSessionChanged(leaf()); };
 
   // --- session lifecycle ---
-  pi.on("session_start", (_e, ctx) => { curCtx = ctx; });
-  pi.on("session_shutdown", (_e, _ctx) => {
-    stopServer();
+  pi.on("session_start", (_e, ctx) => { curCtx = ctx; server?.resyncAll(); });
+  pi.on("session_shutdown", (e, ctx) => {
     curCtx = null;
+    // quit/reload: this pi (or the extension) is going away — release the server.
+    if (e.reason === "quit" || e.reason === "reload") {
+      stopServer();
+      return;
+    }
+    // new/fork (and same-cwd resume): the session is being replaced — keep the
+    // server; the following session_start resyncs all clients to the new session.
+    if (e.reason === "resume" && e.targetSessionFile) {
+      // Cross-cwd resume: pi's extension loader cache is keyed by cwd, so a
+      // different-cwd target RE-IMPORTS this module — a fresh instance whose
+      // module state is null, which would orphan the running server (stale
+      // page, /input 503, port held, not stoppable from the new instance).
+      // Stop it here so the browser gets a clean dead server instead.
+      const curCwd = ctx.sessionManager.getCwd();
+      const targetCwd = sessionFileCwd(e.targetSessionFile);
+      if (targetCwd !== null && targetCwd !== curCwd) stopServer();
+    }
   });
 
   // --- live stream (spec §5 SSE events) ---
@@ -764,6 +829,30 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_info_changed", (_e, ctx) => { curCtx = ctx; changed(); });
   pi.on("agent_start", (_e, ctx) => { curCtx = ctx; server?.broadcast("status", { busy: true }); });
   pi.on("agent_settled", (_e, ctx) => { curCtx = ctx; server?.broadcast("status", { busy: false }); });
+
+  // --- web-side equivalents of built-in commands ---
+  // Same names as the TUI built-ins: in the terminal pi checks the built-ins
+  // first, so TUI behavior is unchanged (cosmetic conflict diagnostic only);
+  // the web path reaches these handlers via inputOpts' expandPromptTemplates.
+  pi.registerCommand("new", {
+    description: "Start a new session",
+    handler: async (_args, ctx) => {
+      const r = await ctx.newSession();
+      server?.broadcast("note", { text: r.cancelled ? "/new: cancelled" : "/new: new session started" });
+    },
+  });
+  pi.registerCommand("compact", {
+    description: "Compact context: /compact [instructions]",
+    handler: async (args, ctx) => {
+      const instructions = (args ?? "").trim();
+      server?.broadcast("note", { text: "/compact: started" + (instructions ? " — " + instructions : "") });
+      ctx.compact(instructions ? {
+        customInstructions: instructions,
+        onComplete: () => { server?.broadcast("note", { text: "/compact: done" }); },
+        onError: (err) => { server?.broadcast("note", { text: "/compact failed: " + err.message }); },
+      } : undefined);
+    },
+  });
 
   // --- commands (spec §3) ---
   pi.registerCommand("webserve", {

@@ -33,12 +33,18 @@ in a browser, enter the password, and the session streams live:
   their input and output.
 - The message box sends real pi user messages. While the agent is busy they
   queue as follow-ups; while idle they start a run.
+- The message box also accepts commands: `/new` starts a new session, and
+  `/compact [instructions]` compacts the context (runs immediately, even
+  while busy; results appear as notes in the view).
 - **Stop** in the header interrupts the run, exactly like Esc.
 - The header shows session name, model, working directory, and a busy
   indicator.
 
-The server shuts down automatically when the session ends (`/new`, `/resume`,
-exit, `/reload`). Each pi terminal gets its own server (8765, 8766, ...).
+The server shuts down when pi quits or on `/reload`. It survives session
+replacement (`/new`, `/fork`, same-directory `/resume`) and resyncs every web
+client to the new session; a cross-directory `/resume` stops it (pi re-imports
+the extension there, which would otherwise orphan the server). Each pi terminal
+gets its own server (8765, 8766, ...).
 
 ## Security
 
@@ -53,8 +59,10 @@ exit, `/reload`). Each pi terminal gets its own server (8765, 8766, ...).
 
 ```bash
 npm install               # dev-only type deps
-node selftest.ts          # 46 checks: password, tokens, sanitizer, leaf diff,
-                          # page JS, full HTTP protocol, live SSE
+node selftest.ts          # 62 checks: password, tokens, sanitizer, leaf diff,
+                          # input dispatch, page JS, HTTP protocol, live SSE,
+                          # pi wiring (factory re-run across session replacement,
+                          # /resume cwd policy)
 npx tsc -p tsconfig.json  # strict type check
 ```
 

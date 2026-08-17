@@ -1,6 +1,9 @@
 // selftest.ts — run: node selftest.ts   (Node >= 23.6, native TS type stripping)
 import http from "node:http";
-import { hashPassword, verifyPassword, issueToken, cookieHeader, clearCookieHeader, tokenFromCookie, sanitizeEntry, diffLeaf, startServer, type AnyRec, LOGIN_PAGE, CHAT_PAGE } from "./index.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { hashPassword, verifyPassword, issueToken, cookieHeader, clearCookieHeader, tokenFromCookie, sanitizeEntry, diffLeaf, inputOpts, startServer, default as piCockpit, type AnyRec, LOGIN_PAGE, CHAT_PAGE } from "./index.ts";
 
 let failed = 0, passed = 0;
 function check(name: string, cond: boolean): void {
@@ -158,6 +161,14 @@ async function httpTests(): Promise<void> {
   ws.stop();
 }
 
+// ---------- input dispatch options ----------
+check("inputOpts: slash input always expands (command/skill/template dispatch)",
+  inputOpts("/new", true).expandPromptTemplates === true && inputOpts("/compact now", false).expandPromptTemplates === true);
+check("inputOpts: non-slash input never expands",
+  inputOpts("hello", false).expandPromptTemplates === false && inputOpts("hello", true).expandPromptTemplates === false);
+check("inputOpts: busy queues as followUp, idle delivers directly",
+  inputOpts("hello", false).deliverAs === "followUp" && inputOpts("hello", true).deliverAs === undefined && inputOpts("/new", true).deliverAs === undefined);
+
 await httpTests();
 
 // ---------- SSE streaming ----------
@@ -224,6 +235,14 @@ async function sseTests(): Promise<void> {
     await waitUntil("event: resync", 3000);
     check("sse: non-descendant leaf -> resync snapshot", client.get().includes("event: resync"));
 
+    // session replacement (e.g. /new): resyncAll pushes the fresh snapshot
+    entries.length = 0;
+    entries.push({ type: "message", id: "n1", parentId: null, timestamp: "9", message: { role: "user", content: "fresh" } });
+    byId.set("n1", entries[0]);
+    ws.resyncAll();
+    await waitUntil('"id":"n1"', 3000);
+    check("sse: resyncAll pushes the new session's snapshot to clients", client.get().includes('"id":"n1"'));
+
     // controller-approved: broadcast must never throw, even for a non-serializable payload
     let circThrew = false;
     {
@@ -239,6 +258,191 @@ async function sseTests(): Promise<void> {
 }
 
 await sseTests();
+
+// ---------- pi wiring: session replacement keeps the running server ----------
+// pi re-invokes the extension factory with a fresh closure on every session
+// replacement and invalidates the old ctx; the fix under test is module-scope
+// server state, so the NEW closure's session_start rebinds curCtx and resyncs
+// the SAME running server (review finding C1). Phase 2 covers the /resume cwd
+// policy: cross-cwd resumes make pi re-IMPORT the module (fresh instance), so
+// the shutdown handler must stop the server there; same-cwd keeps it.
+async function wiringTests(): Promise<void> {
+  type Cmd = { description?: string; handler: (args: string, ctx: unknown) => Promise<void> };
+  const makeFakePi = () => {
+    const handlers = new Map<string, Array<(e: unknown, ctx: unknown) => unknown>>();
+    const commands = new Map<string, Cmd>();
+    const sent: Array<{ text: string }> = [];
+    return {
+      commands,
+      sent,
+      emit(event: string, e: unknown, ctx: unknown): void {
+        for (const h of handlers.get(event) ?? []) h(e, ctx);
+      },
+      pi: {
+        on: (event: string, h: (e: unknown, ctx: unknown) => unknown) => {
+          const arr = handlers.get(event) ?? [];
+          arr.push(h);
+          handlers.set(event, arr);
+        },
+        registerCommand: (name: string, o: Cmd) => { commands.set(name, o); },
+        sendUserMessage: (text: string) => { sent.push({ text }); },
+      } as unknown as Parameters<typeof piCockpit>[0],
+    };
+  };
+  const makeCtx = (entries: Record<string, unknown>[], leafId: string | null) => {
+    const ui = {
+      notes: [] as string[],
+      passwords: ["testpw123"],
+      notify(msg: string, kind: string): void { this.notes.push(kind + ": " + msg); },
+      input(): Promise<string | undefined> { return Promise.resolve(this.passwords.shift()); },
+      setStatus(): void {},
+    };
+    return {
+      ui,
+      ctx: {
+        ui,
+        sessionManager: {
+          getEntries: () => entries,
+          buildContextEntries: () => entries,
+          getCwd: () => "/w",
+          getSessionName: () => null,
+          getLeafId: () => leafId,
+        },
+        model: undefined,
+        isIdle: () => true,
+        abort(): void {},
+        compact(): void {},
+        newSession: async () => ({ cancelled: false }),
+      },
+    };
+  };
+
+  const PORT = 39412;
+  const fake1 = makeFakePi();
+  piCockpit(fake1.pi);
+  const c1 = makeCtx([{
+    type: "message", id: "e1", parentId: null, timestamp: "1",
+    message: { role: "user", content: "first" },
+  }], "e1");
+  fake1.emit("session_start", { type: "session_start", reason: "start" }, c1.ctx);
+
+  await fake1.commands.get("webserve")!.handler("start " + PORT, c1.ctx);
+  const note = c1.ui.notes.find((n) => n.includes("web viewer:")) ?? "";
+  const m = note.match(/localhost:(\d+)/);
+  check("wiring: /webserve start binds the shared server", !!m);
+  if (!m) { check("wiring: abort, no server started", false); return; }
+  const base = "http://127.0.0.1:" + m[1];
+  const login = await fetch(base + "/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: "testpw123" }) });
+  const cookie = (login.headers.get("set-cookie") ?? "").split(";")[0];
+
+  const client = await new Promise<{ get: () => string; close: () => void }>((resolve, reject) => {
+    const chunks: string[] = [];
+    const req = http.get(base + "/events", { headers: { cookie } }, (res) => {
+      res.on("data", (c: Buffer) => chunks.push(c.toString()));
+      resolve({ get: () => chunks.join(""), close: () => req.destroy() });
+    });
+    req.on("error", reject);
+  });
+  const waitUntil = (needle: string, ms: number): Promise<void> =>
+    new Promise((resolve, reject) => {
+      const t0 = Date.now();
+      const t = setInterval(() => {
+        if (client.get().includes(needle)) { clearInterval(t); resolve(); }
+        else if (Date.now() - t0 > ms) { clearInterval(t); reject(new Error("timeout waiting for: " + needle)); }
+      }, 20);
+    });
+
+  let fake2: ReturnType<typeof makeFakePi> | null = null;
+  let c2: ReturnType<typeof makeCtx> | null = null;
+  try {
+    await waitUntil("event: snapshot", 3000);
+
+    const in1 = await fetch(base + "/input", { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify({ text: "before-new" }) });
+    check("wiring: /input works on the first session",
+      in1.status === 200 && fake1.sent.some((s) => s.text === "before-new"));
+
+    await fake1.commands.get("new")!.handler("", c1.ctx);
+    await waitUntil("event: note", 3000);
+    check("wiring: web /new command broadcasts a note to clients",
+      client.get().includes("/new: new session started"));
+
+    // session replacement: the OLD closure gets shutdown, a NEW factory
+    // invocation gets session_start (exactly what pi does on /new)
+    fake1.emit("session_shutdown", { type: "session_shutdown", reason: "new" }, c1.ctx);
+    fake2 = makeFakePi();
+    piCockpit(fake2.pi);
+    c2 = makeCtx([{
+      type: "message", id: "n1", parentId: null, timestamp: "9",
+      message: { role: "user", content: "fresh" },
+    }], "n1");
+    fake2.emit("session_start", { type: "session_start", reason: "new" }, c2.ctx);
+
+    await waitUntil('"id":"n1"', 3000);
+    check("wiring: session replacement resyncs existing clients to the new session",
+      client.get().includes("event: resync") && client.get().includes('"id":"n1"'));
+
+    const in2 = await fetch(base + "/input", { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify({ text: "after-new" }) });
+    check("wiring: /input works after replacement via the same server",
+      in2.status === 200 && fake2.sent.some((s) => s.text === "after-new"));
+
+    await fake2.commands.get("webserve")!.handler("stop", c2.ctx);
+    check("wiring: /webserve stop from the new closure stops the shared server",
+      c2.ui.notes.some((n) => n.includes("web viewer stopped")));
+    let refused = false;
+    try {
+      const r = await fetch(base + "/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: "testpw123" }) });
+      refused = r.status !== 200;
+    } catch { refused = true; }
+    check("wiring: port released after stop", refused);
+  } finally {
+    client.close();
+    if (fake2 && c2) { try { await fake2.commands.get("webserve")!.handler("stop", c2.ctx); } catch { /* already stopped */ } }
+  }
+
+  // --- phase 2: /resume cwd policy (index.ts session_shutdown) ---
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-cockpit-st-"));
+  const writeHead = (f: string, cwd: string): Promise<void> =>
+    fs.promises.writeFile(path.join(tmp, f), JSON.stringify({ type: "session", id: "s", cwd }) + "\n");
+  let fake3: ReturnType<typeof makeFakePi> | null = null;
+  let c3: ReturnType<typeof makeCtx> | null = null;
+  try {
+    await writeHead("other.jsonl", "/elsewhere");
+    await writeHead("same.jsonl", "/w"); // makeCtx's fake cwd
+
+    fake3 = makeFakePi();
+    piCockpit(fake3.pi);
+    c3 = makeCtx([{
+      type: "message", id: "e3", parentId: null, timestamp: "1",
+      message: { role: "user", content: "three" },
+    }], "e3");
+    c3.ui.passwords.push("testpw123"); // second start in this phase
+    fake3.emit("session_start", { type: "session_start", reason: "start" }, c3.ctx);
+    await fake3.commands.get("webserve")!.handler("start 39413", c3.ctx);
+    const note3 = c3.ui.notes.find((n) => n.includes("web viewer:")) ?? "";
+    const m3 = note3.match(/localhost:(\d+)/);
+    check("wiring: server up for resume-policy phase", !!m3);
+    if (!m3) { check("wiring: resume phase abort, no server", false); return; }
+    const base3 = "http://127.0.0.1:" + m3[1];
+    const up = async (): Promise<boolean> => {
+      try { return (await fetch(base3 + "/")).status === 200; } catch { return false; } // GET / serves the login page
+    };
+    check("wiring: resume phase server serves", await up());
+
+    fake3.emit("session_shutdown", { type: "session_shutdown", reason: "resume", targetSessionFile: path.join(tmp, "other.jsonl") }, c3.ctx);
+    check("wiring: cross-cwd /resume stops the shared server", !(await up()));
+
+    await fake3.commands.get("webserve")!.handler("start 39413", c3.ctx);
+    check("wiring: restart after cross-cwd stop", await up());
+
+    fake3.emit("session_shutdown", { type: "session_shutdown", reason: "resume", targetSessionFile: path.join(tmp, "same.jsonl") }, c3.ctx);
+    check("wiring: same-cwd /resume keeps the server", await up());
+  } finally {
+    if (fake3 && c3) { try { await fake3.commands.get("webserve")!.handler("stop", c3.ctx); } catch { /* ok */ } }
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+}
+
+await wiringTests();
 
 console.log("\n" + passed + " passed, " + failed + " failed");
 if (failed > 0) process.exit(1);
