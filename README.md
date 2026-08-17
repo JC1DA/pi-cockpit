@@ -32,8 +32,9 @@ in a browser, enter the password, and the session streams live:
 
 - Assistant text appears token by token; tool calls render as cards with
   their input and output.
-- The message box sends real pi user messages. While the agent is busy they
-  queue as follow-ups; while idle they start a run.
+- The message box sends real pi user messages. While the agent is busy,
+  Send steers the running agent (like Enter in the terminal) and the Queue
+  button (or alt+enter) waits until it finishes; while idle they start a run.
 - The message box also accepts commands: `/new` starts a new session,
   `/compact [instructions]` compacts the context, and `/model
   [provider/model-id]` switches the model (bare `/model` lists the available

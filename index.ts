@@ -136,13 +136,16 @@ export function diffLeaf(
   return { kind: "append", entries: path };
 }
 
-// Delivery options for user input (TUI parity). "/" input goes through pi's
-// dispatch: registered commands execute immediately (even while streaming),
-// skills/prompt templates expand; anything else queues as followUp while busy.
-export function inputOpts(text: string, idle: boolean): { deliverAs?: "followUp"; expandPromptTemplates?: boolean } {
+// Delivery options for user input (TUI parity). "/" input keeps the proven
+// command path: registered commands execute immediately (even while streaming),
+// skills/prompt templates expand, delivery is followUp while busy. Chat
+// messages steer the running agent like the terminal's Enter; "followUp"
+// mirrors alt+enter (queue until the agent finishes). Idle = direct delivery.
+export function inputOpts(text: string, idle: boolean, mode: "steer" | "followUp" = "steer"): { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean } {
+  const cmd = text.startsWith("/");
   return {
-    deliverAs: idle ? undefined : "followUp",
-    expandPromptTemplates: text.startsWith("/"),
+    deliverAs: idle ? undefined : cmd ? "followUp" : mode,
+    expandPromptTemplates: cmd,
   };
 }
 
@@ -501,6 +504,8 @@ details.tool pre{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;color
 footer{display:flex;gap:8px;padding:10px 12px;background:var(--panel);border-top:1px solid #333}
 footer textarea{flex:1;resize:none;height:56px;background:#111;color:var(--text);border:1px solid #444;border-radius:8px;padding:8px;font:inherit}
 footer button{background:var(--user);color:#fff;border:0;border-radius:8px;padding:0 16px;cursor:pointer;font:inherit}
+footer button#queue{display:none;background:#374151}
+footer button#queue.show{display:inline-block}
 #askmask,#modelmask,#treemask{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:50;display:none;align-items:flex-end;justify-content:center}
 #askmask.open,#modelmask.open,#treemask.open{display:flex}
 .askbox{background:var(--panel);border:1px solid #444;border-radius:12px;width:100%;max-width:640px;max-height:85vh;overflow-y:auto;padding:14px}
@@ -531,6 +536,7 @@ footer button{background:var(--user);color:#fff;border:0;border-radius:8px;paddi
 <div id="msgs"></div>
 <footer>
 <textarea id="input" placeholder="Message..."></textarea>
+<button id="queue">Queue</button>
 <button id="send">Send</button>
 </footer>
 <script>
@@ -538,7 +544,8 @@ var msgs = document.getElementById('msgs'),
     input = document.getElementById('input'),
     dot = document.getElementById('dot'),
     metaEl = document.getElementById('meta'),
-    stopBtn = document.getElementById('stop');
+    stopBtn = document.getElementById('stop'),
+    queueBtn = document.getElementById('queue');
 var curMeta = {}, pendingEl = null, userQ = [];
 
 function esc(s) {
@@ -603,7 +610,8 @@ function updateMetaLine() {
 function setBusy(b) {
   dot.classList.toggle('busy', b);
   stopBtn.classList.toggle('show', b);
-  input.placeholder = b ? 'Agent busy — your message will queue...' : 'Message...';
+  queueBtn.classList.toggle('show', b);
+  input.placeholder = b ? 'Agent busy — Send steers this run · Queue waits' : 'Message...';
 }
 function toolEl(id, name, state) {
   var el = document.getElementById('call-' + id);
@@ -1027,7 +1035,7 @@ function showTreePick(d) {
 es.addEventListener('treepick', function (e) { showTreePick(JSON.parse(e.data)); });
 treeMask.addEventListener('click', function (e) { if (e.target === treeMask) hideTreePick(); });
 
-function sendText(t) {
+function sendText(t, mode) {
   if (!t) return;
   input.value = '';
   var el = addMsg('user', esc(t), 'pendinguser');
@@ -1035,16 +1043,18 @@ function sendText(t) {
   fetch('/input', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text: t })
+    body: JSON.stringify({ text: t, mode: mode || 'steer' })
   }).then(function (r) {
     if (!r.ok) return r.json().then(function (d) { alert('send failed: ' + (d.error || r.status)); });
   }).catch(function (err) { alert('send failed: ' + err); });
 }
-function send() { sendText(input.value.trim()); }
+// TUI parity: Enter steers the running agent, alt+enter queues a follow-up.
+function send() { sendText(input.value.trim(), 'steer'); }
 input.addEventListener('keydown', function (e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(input.value.trim(), e.altKey ? 'followUp' : 'steer'); }
 });
 document.getElementById('send').addEventListener('click', send);
+queueBtn.addEventListener('click', function () { sendText(input.value.trim(), 'followUp'); });
 stopBtn.addEventListener('click', function () {
   fetch('/stop', { method: 'POST' }).then(function () { setBusy(false); });
 });
@@ -1075,7 +1085,7 @@ export interface SnapshotMeta {
 export interface WebApi {
   getSnapshot(): { entries: AnyRec[]; meta: SnapshotMeta };
   allEntries(): Map<string, AnyRec>;
-  sendInput(text: string): Promise<{ queued: boolean }>;
+  sendInput(text: string, mode?: "steer" | "followUp"): Promise<{ queued: boolean }>;
   stopAgent(): { aborted: boolean };
 }
 
@@ -1262,7 +1272,8 @@ export function startServer(opts: {
         const text = typeof body.text === "string" ? (body.text as string).trim() : "";
         if (!text) { json(res, 400, { error: "empty message" }); return; }
         if (text.length > INPUT_LIMIT) { json(res, 400, { error: "message too long" }); return; }
-        const r = await api.sendInput(text);
+        const mode = body.mode === "followUp" ? "followUp" : "steer";
+        const r = await api.sendInput(text, mode);
         json(res, 200, { ok: true, queued: r.queued });
         return;
       }
@@ -1469,13 +1480,14 @@ export default function (pi: ExtensionAPI): void {
       }
       return m;
     },
-    async sendInput(text) {
+    async sendInput(text, mode: "steer" | "followUp" = "steer") {
       const ctx = curCtx;
       const p = curPi;
       if (!ctx || !p) throw noCtxError();
       const idle = ctx.isIdle();
-      p.sendUserMessage(text, inputOpts(text, idle));
-      return { queued: !idle };
+      const opts = inputOpts(text, idle, mode);
+      p.sendUserMessage(text, opts);
+      return { queued: !idle && opts.deliverAs === "followUp" };
     },
     stopAgent() {
       const ctx = curCtx;

@@ -34,7 +34,9 @@ from another machine on your LAN and type messages back into the agent.
 
 ## Behavior
 - Messages sent from the web appear in the terminal exactly as if typed there.
-  While the agent is busy they queue until it finishes (follow-up delivery).
+  While the agent is busy, Send steers the running agent (terminal Enter
+  parity); the Queue button or alt+enter queues a follow-up until it finishes.
+  Commands keep the command path in both cases.
 - The web input box also accepts commands: `/new` starts a new session,
   `/compact [instructions]` compacts the context, `/model [provider/model-id]`
   switches the model, and `/tree [entry-id]` jumps to a previous point in the

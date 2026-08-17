@@ -120,6 +120,9 @@ function check(name: string, cond: boolean): void {
     CHAT_PAGE.includes("addEventListener('treepick'") && CHAT_PAGE.includes("sendText('/tree '") &&
     CHAT_PAGE.includes("'treemask'"));
 
+  check("page: Queue button (busy only) sends followUp; default send steers",
+    CHAT_PAGE.includes('id="queue"') && CHAT_PAGE.includes("'followUp'") && CHAT_PAGE.includes("'steer'"));
+
   const metaSegSrc = fnSrc("metaSeg");
   const upMetaSrc = fnSrc("updateMetaLine");
   type FakeEl = { children: FakeEl[]; textContent: string; className: string; appendChild(c: FakeEl): void };
@@ -315,8 +318,12 @@ check("inputOpts: slash input always expands (command/skill/template dispatch)",
   inputOpts("/new", true).expandPromptTemplates === true && inputOpts("/compact now", false).expandPromptTemplates === true);
 check("inputOpts: non-slash input never expands",
   inputOpts("hello", false).expandPromptTemplates === false && inputOpts("hello", true).expandPromptTemplates === false);
-check("inputOpts: busy queues as followUp, idle delivers directly",
-  inputOpts("hello", false).deliverAs === "followUp" && inputOpts("hello", true).deliverAs === undefined && inputOpts("/new", true).deliverAs === undefined);
+check("inputOpts: busy chat input steers by default (TUI Enter parity)",
+  inputOpts("hello", false).deliverAs === "steer");
+check("inputOpts: busy chat input can queue as followUp (TUI alt+enter parity)",
+  inputOpts("hello", false, "followUp").deliverAs === "followUp");
+check("inputOpts: busy slash input keeps the command path (followUp); idle delivers directly",
+  inputOpts("/new", false).deliverAs === "followUp" && inputOpts("/new", true).deliverAs === undefined && inputOpts("hello", true).deliverAs === undefined);
 
 await httpTests();
 
