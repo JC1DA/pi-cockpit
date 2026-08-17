@@ -146,6 +146,15 @@ export function inputOpts(text: string, idle: boolean): { deliverAs?: "followUp"
   };
 }
 
+/** One-line preview of a message entry's text (whitespace-collapsed, capped) for the /tree picker. */
+export function entryPreview(e: AnyRec): string {
+  const c = (e.message as AnyRec | undefined)?.content;
+  let t = "";
+  if (typeof c === "string") t = c;
+  else if (Array.isArray(c)) t = c.map((b) => (b && typeof (b as AnyRec).text === "string" ? (b as AnyRec).text : "")).join(" ");
+  return t.replace(/\s+/g, " ").trim().slice(0, 120);
+}
+
 // ---------------------------------------------------------------------------
 // ask_user_question bridge — answer the agent's questions from the web
 // ---------------------------------------------------------------------------
@@ -492,8 +501,8 @@ details.tool pre{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;color
 footer{display:flex;gap:8px;padding:10px 12px;background:var(--panel);border-top:1px solid #333}
 footer textarea{flex:1;resize:none;height:56px;background:#111;color:var(--text);border:1px solid #444;border-radius:8px;padding:8px;font:inherit}
 footer button{background:var(--user);color:#fff;border:0;border-radius:8px;padding:0 16px;cursor:pointer;font:inherit}
-#askmask,#modelmask{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:50;display:none;align-items:flex-end;justify-content:center}
-#askmask.open,#modelmask.open{display:flex}
+#askmask,#modelmask,#treemask{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:50;display:none;align-items:flex-end;justify-content:center}
+#askmask.open,#modelmask.open,#treemask.open{display:flex}
 .askbox{background:var(--panel);border:1px solid #444;border-radius:12px;width:100%;max-width:640px;max-height:85vh;overflow-y:auto;padding:14px}
 .asktitle{font-size:13px;color:var(--dim);margin:0 0 10px}
 .askq{margin:12px 0;padding:10px;background:#161618;border:1px solid #2a2a30;border-radius:8px}
@@ -704,8 +713,8 @@ function renderSnapshot(d) {
 }
 
 var es = new EventSource('/events');
-es.addEventListener('snapshot', function (e) { hideAsk(); hideModelPick(); renderSnapshot(JSON.parse(e.data)); }); // a resync means the old session (and any pending ask/picker of it) is gone
-es.addEventListener('resync', function (e) { hideModelPick(); renderSnapshot(JSON.parse(e.data)); });
+es.addEventListener('snapshot', function (e) { hideAsk(); hideModelPick(); hideTreePick(); renderSnapshot(JSON.parse(e.data)); }); // a resync means the old session (and any pending ask/picker of it) is gone
+es.addEventListener('resync', function (e) { hideModelPick(); hideTreePick(); renderSnapshot(JSON.parse(e.data)); });
 es.addEventListener('update', function (e) {
   var m = JSON.parse(e.data);
   if (!pendingEl) {
@@ -950,6 +959,73 @@ function showModelPick(d) {
 }
 es.addEventListener('modelpick', function (e) { showModelPick(JSON.parse(e.data)); });
 modelMask.addEventListener('click', function (e) { if (e.target === modelMask) hideModelPick(); });
+
+// --- tree picker: bare /tree (server 'treepick' event) opens a one-click
+// modal of the session's user messages; a pick re-sends '/tree <entry-id>'
+// through the normal input path and the session resyncs via session_tree
+var treeMask = document.createElement('div');
+treeMask.id = 'treemask';
+document.body.appendChild(treeMask);
+function hideTreePick() {
+  treeMask.classList.remove('open');
+  treeMask.innerHTML = '';
+}
+function fmtTs(ts) {
+  var d = new Date(ts);
+  if (isNaN(d.getTime())) return '';
+  var p = function (n) { return n < 10 ? '0' + n : '' + n; };
+  return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function pickTree(id) {
+  if (!treeMask.classList.contains('open')) return; // guard: label+radio click can double-fire
+  hideTreePick();
+  sendText('/tree ' + id);
+}
+function showTreePick(d) {
+  var box = document.createElement('div');
+  box.className = 'askbox';
+  var t = document.createElement('div');
+  t.className = 'asktitle';
+  t.textContent = 'Jump to a previous message';
+  box.appendChild(t);
+  (d.points || []).forEach(function (p) {
+    var row = document.createElement('label');
+    row.className = 'askopt';
+    var inp = document.createElement('input');
+    inp.type = 'radio';
+    inp.name = 'treepick';
+    inp.value = p.id;
+    if (p.id === d.current) inp.checked = true;
+    row.appendChild(inp);
+    var s = document.createElement('span');
+    s.className = 'olabel';
+    var when = fmtTs(p.ts);
+    s.textContent = (when ? '[' + when + '] ' : '') + p.text + (p.id === d.current ? ' (current)' : '');
+    row.appendChild(s);
+    row.addEventListener('click', function () { pickTree(p.id); });
+    box.appendChild(row);
+  });
+  var btns = document.createElement('div');
+  btns.className = 'askbtns';
+  var ok = document.createElement('button');
+  ok.textContent = 'Jump';
+  ok.addEventListener('click', function () {
+    var sel = box.querySelector('input[name=treepick]:checked');
+    if (sel) pickTree(sel.value);
+  });
+  var cancel = document.createElement('button');
+  cancel.className = 'askcancel';
+  cancel.textContent = 'Cancel';
+  cancel.addEventListener('click', hideTreePick);
+  btns.appendChild(ok);
+  btns.appendChild(cancel);
+  box.appendChild(btns);
+  treeMask.innerHTML = '';
+  treeMask.appendChild(box);
+  treeMask.classList.add('open');
+}
+es.addEventListener('treepick', function (e) { showTreePick(JSON.parse(e.data)); });
+treeMask.addEventListener('click', function (e) { if (e.target === treeMask) hideTreePick(); });
 
 function sendText(t) {
   if (!t) return;
@@ -1589,6 +1665,43 @@ export default function (pi: ExtensionAPI): void {
       }
       const ok = await pi.setModel(m);
       server?.broadcast("note", { text: ok ? "/model: " + m.provider + "/" + m.id : "/model: no API key for " + m.provider + "/" + m.id });
+    },
+  });
+
+  // /tree — the built-in one is a TUI picker; this gives the web viewer its
+  // own. Bare /tree broadcasts the session's user messages as a `treepick`
+  // event; the web page renders a one-click picker whose pick re-sends
+  // `/tree <entry-id>`. ctx.navigateTree is the same runtime op as the TUI's
+  // /tree: it throws while streaming, no-ops at the target, and fires
+  // session_tree (listened above), which resyncs every web client. No branch
+  // summary is requested (the TUI prompts for one; the web stays minimal).
+  pi.registerCommand("tree", {
+    description: "Jump to a previous point in this session: /tree [entry-id]",
+    handler: async (args, ctx) => {
+      const pick = (args ?? "").trim();
+      const leaf = ctx.sessionManager.getLeafId();
+      if (pick === "") {
+        const raw = ctx.sessionManager.getEntries().map((e) => e as unknown as AnyRec);
+        const points = raw
+          .filter((e) => e.type === "message" && (e.message as AnyRec | undefined)?.role === "user")
+          .map((e) => ({ id: e.id as string, text: entryPreview(e), ts: (e.timestamp as string) ?? "" }));
+        if (points.length === 0) {
+          server?.broadcast("note", { text: "/tree: no messages in this session yet" });
+          return;
+        }
+        server?.broadcast("treepick", { points, current: leaf });
+        return;
+      }
+      const before = leaf;
+      let r: { cancelled: boolean };
+      try {
+        r = await ctx.navigateTree(pick);
+      } catch (err) {
+        server?.broadcast("note", { text: "/tree: " + (err as Error).message });
+        return;
+      }
+      const after = ctx.sessionManager.getLeafId();
+      server?.broadcast("note", { text: r.cancelled ? "/tree: cancelled" : after !== before ? "/tree: jumped to " + pick : "/tree: already at " + pick });
     },
   });
 

@@ -116,6 +116,10 @@ function check(name: string, cond: boolean): void {
     CHAT_PAGE.includes("addEventListener('modelpick'") && CHAT_PAGE.includes("sendText('/model '") &&
     CHAT_PAGE.includes("'modelmask'"));
 
+  check("page: tree picker modal wired (treepick event -> /tree command via /input)",
+    CHAT_PAGE.includes("addEventListener('treepick'") && CHAT_PAGE.includes("sendText('/tree '") &&
+    CHAT_PAGE.includes("'treemask'"));
+
   const metaSegSrc = fnSrc("metaSeg");
   const upMetaSrc = fnSrc("updateMetaLine");
   type FakeEl = { children: FakeEl[]; textContent: string; className: string; appendChild(c: FakeEl): void };
@@ -525,6 +529,8 @@ async function wiringTests(): Promise<void> {
     tuiTypes: boolean;
   };
   const makeCtx = (entries: Record<string, unknown>[], leafId: string | null) => {
+    let leaf = leafId;
+    const navCalls: string[] = [];
     const usage: { tokens: number | null; contextWindow: number; percent: number | null } = { tokens: null, contextWindow: 200000, percent: null };
     const ask: AskTestState = { lastComp: null, doneCalls: [], tuiTypes: false };
     // Emulates pi's custom() plumbing: runs the factory, resolves the returned
@@ -551,6 +557,7 @@ async function wiringTests(): Promise<void> {
       ui,
       usage,
       ask,
+      navCalls,
       ctx: {
         ui,
         sessionManager: {
@@ -558,7 +565,7 @@ async function wiringTests(): Promise<void> {
           buildContextEntries: () => entries,
           getCwd: () => "/w",
           getSessionName: () => null,
-          getLeafId: () => leafId,
+          getLeafId: () => leaf,
         },
         model: undefined as { provider: string; id: string } | undefined,
         modelRegistry: {
@@ -573,6 +580,13 @@ async function wiringTests(): Promise<void> {
         abort(): void {},
         compact(): void {},
         newSession: async () => ({ cancelled: false }),
+        // Emulates the runtime op: throws for unknown entries, otherwise moves the leaf.
+        navigateTree: async (id: string) => {
+          navCalls.push(id);
+          if (!entries.some((e) => e.id === id)) throw new Error("Entry " + id + " not found");
+          leaf = id;
+          return { cancelled: false };
+        },
         getContextUsage: () => ({ ...usage }),
       },
     };
@@ -581,10 +595,10 @@ async function wiringTests(): Promise<void> {
   const PORT = 39412;
   const fake1 = makeFakePi();
   piCockpit(fake1.pi);
-  const c1 = makeCtx([{
-    type: "message", id: "e1", parentId: null, timestamp: "1",
-    message: { role: "user", content: "first" },
-  }], "e1");
+  const c1 = makeCtx([
+    { type: "message", id: "e1", parentId: null, timestamp: "1", message: { role: "user", content: "first" } },
+    { type: "message", id: "e2", parentId: "e1", timestamp: "2", message: { role: "user", content: "second" } },
+  ], "e1");
   fake1.emit("session_start", { type: "session_start", reason: "start" }, c1.ctx);
 
   await fake1.commands.get("webserve")!.handler("start " + PORT, c1.ctx);
@@ -667,6 +681,28 @@ async function wiringTests(): Promise<void> {
     await waitUntil("no API key", 3000);
     check("wiring: web /model without API key reports failure",
       client.get().includes("no API key for p3/m2") && fake1.setModelCalls.length === 2);
+
+    // web /tree: picker broadcast, jump, already-at, unknown id
+    await fake1.commands.get("tree")!.handler("", c1.ctx);
+    await waitUntil("event: treepick", 3000);
+    check("wiring: web /tree broadcasts a picker with user-message jump points",
+      client.get().includes('"id":"e1"') && client.get().includes('"id":"e2"') &&
+      client.get().includes('"current":"e1"') && client.get().includes('"text":"second"'));
+
+    await fake1.commands.get("tree")!.handler("e2", c1.ctx);
+    await waitUntil("jumped to", 3000);
+    check("wiring: web /tree id calls navigateTree and notes the jump",
+      client.get().includes("/tree: jumped to e2") && c1.navCalls.length === 1 && c1.navCalls[0] === "e2");
+
+    await fake1.commands.get("tree")!.handler("e2", c1.ctx);
+    await waitUntil("already at", 3000);
+    check("wiring: web /tree at the current leaf notes already-at",
+      client.get().includes("/tree: already at e2"));
+
+    await fake1.commands.get("tree")!.handler("nope", c1.ctx);
+    await waitUntil("not found", 3000);
+    check("wiring: web /tree unknown entry notes an error",
+      client.get().includes("Entry nope not found") && c1.navCalls.length === 3);
 
     // session replacement: the OLD closure gets shutdown, a NEW factory
     // invocation gets session_start (exactly what pi does on /new)
