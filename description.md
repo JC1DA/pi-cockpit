@@ -35,9 +35,12 @@ from another machine on your LAN and type messages back into the agent.
 ## Behavior
 - Messages sent from the web appear in the terminal exactly as if typed there.
   While the agent is busy they queue until it finishes (follow-up delivery).
-- The web input box also accepts commands: `/new` starts a new session and
-  `/compact [instructions]` compacts the context. Commands execute immediately,
-  even while the agent is busy, and results show as notes in the web view.
+- The web input box also accepts commands: `/new` starts a new session,
+  `/compact [instructions]` compacts the context, and `/model [provider/model-id]`
+  switches the model. Bare `/model` opens a one-click picker modal listing all
+  available models (the current one marked; picking one is the same as typing
+  the switch command). Commands execute immediately, even while the agent is
+  busy, and results show as notes in the web view.
   Other `/`-prefixed input follows terminal semantics (skills, prompt
   templates; unknown text goes to the model as literal text).
 - The **Stop** button in the web header behaves like Esc in the terminal.

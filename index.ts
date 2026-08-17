@@ -488,12 +488,12 @@ details.tool{align-self:flex-start;max-width:85%;background:var(--tool);border:1
 details.tool.err{border-color:#b91c1c}
 details.tool summary{cursor:pointer;color:var(--dim);font-size:12px}
 details.tool pre{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;color:#c8c8c8}
-.note{align-self:center;color:var(--dim);font-size:12px}
+.note{align-self:center;color:var(--dim);font-size:12px;white-space:pre-wrap}
 footer{display:flex;gap:8px;padding:10px 12px;background:var(--panel);border-top:1px solid #333}
 footer textarea{flex:1;resize:none;height:56px;background:#111;color:var(--text);border:1px solid #444;border-radius:8px;padding:8px;font:inherit}
 footer button{background:var(--user);color:#fff;border:0;border-radius:8px;padding:0 16px;cursor:pointer;font:inherit}
-#askmask{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:50;display:none;align-items:flex-end;justify-content:center}
-#askmask.open{display:flex}
+#askmask,#modelmask{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:50;display:none;align-items:flex-end;justify-content:center}
+#askmask.open,#modelmask.open{display:flex}
 .askbox{background:var(--panel);border:1px solid #444;border-radius:12px;width:100%;max-width:640px;max-height:85vh;overflow-y:auto;padding:14px}
 .asktitle{font-size:13px;color:var(--dim);margin:0 0 10px}
 .askq{margin:12px 0;padding:10px;background:#161618;border:1px solid #2a2a30;border-radius:8px}
@@ -704,8 +704,8 @@ function renderSnapshot(d) {
 }
 
 var es = new EventSource('/events');
-es.addEventListener('snapshot', function (e) { hideAsk(); renderSnapshot(JSON.parse(e.data)); }); // a resync means the old session (and any pending ask of it) is gone
-es.addEventListener('resync', function (e) { renderSnapshot(JSON.parse(e.data)); });
+es.addEventListener('snapshot', function (e) { hideAsk(); hideModelPick(); renderSnapshot(JSON.parse(e.data)); }); // a resync means the old session (and any pending ask/picker of it) is gone
+es.addEventListener('resync', function (e) { hideModelPick(); renderSnapshot(JSON.parse(e.data)); });
 es.addEventListener('update', function (e) {
   var m = JSON.parse(e.data);
   if (!pendingEl) {
@@ -892,8 +892,66 @@ es.addEventListener('ask-resolved', function (e) {
   if (askState && d.id === askState.id) hideAsk();
 });
 
-function send() {
-  var t = input.value.trim();
+// --- model picker: bare /model (server 'modelpick' event) opens a one-click
+// modal; a pick re-sends '/model provider/id' through the normal input path
+var modelMask = document.createElement('div');
+modelMask.id = 'modelmask';
+document.body.appendChild(modelMask);
+function hideModelPick() {
+  modelMask.classList.remove('open');
+  modelMask.innerHTML = '';
+}
+function pickModel(c) {
+  if (!modelMask.classList.contains('open')) return; // guard: label+radio click can double-fire
+  hideModelPick();
+  sendText('/model ' + c);
+}
+function showModelPick(d) {
+  var box = document.createElement('div');
+  box.className = 'askbox';
+  var t = document.createElement('div');
+  t.className = 'asktitle';
+  t.textContent = 'Select model — ' + (d.current || '');
+  box.appendChild(t);
+  (d.choices || []).forEach(function (c) {
+    var row = document.createElement('label');
+    row.className = 'askopt';
+    var inp = document.createElement('input');
+    inp.type = 'radio';
+    inp.name = 'modelpick';
+    inp.value = c;
+    if (c === d.current) inp.checked = true;
+    row.appendChild(inp);
+    var s = document.createElement('span');
+    s.className = 'olabel';
+    s.textContent = c + (c === d.current ? ' (current)' : '');
+    row.appendChild(s);
+    row.addEventListener('click', function () { pickModel(c); });
+    box.appendChild(row);
+  });
+  var btns = document.createElement('div');
+  btns.className = 'askbtns';
+  var ok = document.createElement('button');
+  ok.textContent = 'Switch';
+  ok.addEventListener('click', function () {
+    var sel = box.querySelector('input[name=modelpick]:checked');
+    if (sel) pickModel(sel.value);
+  });
+  var cancel = document.createElement('button');
+  cancel.className = 'askcancel';
+  cancel.textContent = 'Cancel';
+  cancel.addEventListener('click', hideModelPick);
+  btns.appendChild(ok);
+  btns.appendChild(cancel);
+  box.appendChild(btns);
+  modelMask.innerHTML = '';
+  modelMask.appendChild(box);
+  modelMask.classList.add('open');
+}
+es.addEventListener('modelpick', function (e) { showModelPick(JSON.parse(e.data)); });
+modelMask.addEventListener('click', function (e) { if (e.target === modelMask) hideModelPick(); });
+
+function sendText(t) {
   if (!t) return;
   input.value = '';
   var el = addMsg('user', esc(t), 'pendinguser');
@@ -906,6 +964,7 @@ function send() {
     if (!r.ok) return r.json().then(function (d) { alert('send failed: ' + (d.error || r.status)); });
   }).catch(function (err) { alert('send failed: ' + err); });
 }
+function send() { sendText(input.value.trim()); }
 input.addEventListener('keydown', function (e) {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
@@ -1489,6 +1548,47 @@ export default function (pi: ExtensionAPI): void {
         onComplete: () => { server?.broadcast("note", { text: "/compact: done" }); },
         onError: (err) => { server?.broadcast("note", { text: "/compact failed: " + err.message }); },
       } : undefined);
+    },
+  });
+
+  // /model — the built-in one is TUI-only; this gives the web viewer its own.
+  // Bare /model broadcasts the selectable set (scoped models when scoping is
+  // configured, else everything with valid auth — the set the TUI picker
+  // shows) as a `modelpick` event; the web page renders a one-click picker
+  // modal whose pick re-sends `/model provider/model-id`. A bare id
+  // (unambiguous) switches too. The model_select listener above updates the
+  // web header automatically.
+  pi.registerCommand("model", {
+    description: "Show or switch the model: /model [provider/model-id]",
+    handler: async (args, ctx) => {
+      const scoped = ctx.scopedModels.map((s) => s.model);
+      const pool = scoped.length > 0 ? scoped : ctx.modelRegistry.getAvailable();
+      const pick = (args ?? "").trim();
+      if (pick === "") {
+        if (pool.length === 0) {
+          server?.broadcast("note", { text: "/model: no available models — check API keys / models.json" });
+          return;
+        }
+        const cur = ctx.model ? ctx.model.provider + "/" + ctx.model.id : "";
+        server?.broadcast("modelpick", { choices: pool.map((m) => m.provider + "/" + m.id), current: cur });
+        return;
+      }
+      const slash = pick.indexOf("/");
+      let m = slash >= 0 ? ctx.modelRegistry.find(pick.slice(0, slash), pick.slice(slash + 1)) : undefined;
+      if (slash < 0) {
+        const cands = pool.filter((x) => x.id === pick);
+        if (cands.length === 1) m = cands[0];
+        else if (cands.length > 1) {
+          server?.broadcast("note", { text: "/model: '" + pick + "' is ambiguous — try: " + cands.map((x) => x.provider + "/" + x.id).join(", ") });
+          return;
+        }
+      }
+      if (!m) {
+        server?.broadcast("note", { text: "/model: unknown model '" + pick + "' — use bare /model to list available ones" });
+        return;
+      }
+      const ok = await pi.setModel(m);
+      server?.broadcast("note", { text: ok ? "/model: " + m.provider + "/" + m.id : "/model: no API key for " + m.provider + "/" + m.id });
     },
   });
 

@@ -112,6 +112,10 @@ function check(name: string, cond: boolean): void {
   check("page: mobile CSS wraps meta and hides cwd",
     CHAT_PAGE.includes("@media (max-width:640px)") && CHAT_PAGE.includes("m-cwd"));
 
+  check("page: model picker modal wired (modelpick event -> /model command via /input)",
+    CHAT_PAGE.includes("addEventListener('modelpick'") && CHAT_PAGE.includes("sendText('/model '") &&
+    CHAT_PAGE.includes("'modelmask'"));
+
   const metaSegSrc = fnSrc("metaSeg");
   const upMetaSrc = fnSrc("updateMetaLine");
   type FakeEl = { children: FakeEl[]; textContent: string; className: string; appendChild(c: FakeEl): void };
@@ -480,14 +484,23 @@ await askServerTests();
 // the shutdown handler must stop the server there; same-cwd keeps it.
 async function wiringTests(): Promise<void> {
   type Cmd = { description?: string; handler: (args: string, ctx: unknown) => Promise<void> };
+  // Tiny model catalogue for the /model handler: p3/m2 shares its id with
+  // p2/m2 (ambiguity test) and the fake setModel rejects p3 (no-API-key path).
+  const MODELS = [
+    { provider: "p", id: "m" },
+    { provider: "p2", id: "m2" },
+    { provider: "p3", id: "m2" },
+  ];
   const makeFakePi = () => {
     const handlers = new Map<string, Array<(e: unknown, ctx: unknown) => unknown>>();
     const commands = new Map<string, Cmd>();
     const sent: Array<{ text: string }> = [];
+    const setModelCalls: Array<{ provider: string; id: string }> = [];
     return {
       commands,
       sent,
       handlers,
+      setModelCalls,
       emit(event: string, e: unknown, ctx: unknown): void {
         for (const h of handlers.get(event) ?? []) h(e, ctx);
       },
@@ -499,6 +512,10 @@ async function wiringTests(): Promise<void> {
         },
         registerCommand: (name: string, o: Cmd) => { commands.set(name, o); },
         sendUserMessage: (text: string) => { sent.push({ text }); },
+        setModel: (m: { provider: string; id: string }) => {
+          setModelCalls.push(m);
+          return Promise.resolve(m.provider !== "p3");
+        },
       } as unknown as Parameters<typeof piCockpit>[0],
     };
   };
@@ -543,7 +560,12 @@ async function wiringTests(): Promise<void> {
           getSessionName: () => null,
           getLeafId: () => leafId,
         },
-        model: undefined,
+        model: undefined as { provider: string; id: string } | undefined,
+        modelRegistry: {
+          getAvailable: () => MODELS,
+          find: (p: string, id: string) => MODELS.find((x) => x.provider === p && x.id === id),
+        },
+        scopedModels: [],
         hasUI: true,
         mode: "tui",
         signal: undefined,
@@ -618,6 +640,33 @@ async function wiringTests(): Promise<void> {
     await waitUntil("event: note", 3000);
     check("wiring: web /new command broadcasts a note to clients",
       client.get().includes("/new: new session started"));
+
+    // web /model: picker broadcast, switch, ambiguous bare id, unknown, no API key
+    c1.ctx.model = MODELS[0];
+    await fake1.commands.get("model")!.handler("", c1.ctx);
+    await waitUntil("event: modelpick", 3000);
+    check("wiring: web /model broadcasts a picker with all choices and the current model",
+      client.get().includes('"choices":["p/m","p2/m2","p3/m2"]') && client.get().includes('"current":"p/m"'));
+
+    await fake1.commands.get("model")!.handler("p2/m2", c1.ctx);
+    await waitUntil("/model: p2/m2", 3000);
+    check("wiring: web /model provider/id calls pi.setModel and notes the switch",
+      client.get().includes("/model: p2/m2") && fake1.setModelCalls.length === 1 && fake1.setModelCalls[0].provider === "p2");
+
+    await fake1.commands.get("model")!.handler("m2", c1.ctx);
+    await waitUntil("is ambiguous", 3000);
+    check("wiring: web /model bare id matching two providers is ambiguous, no setModel",
+      client.get().includes("p2/m2, p3/m2") && fake1.setModelCalls.length === 1);
+
+    await fake1.commands.get("model")!.handler("nope/xyz", c1.ctx);
+    await waitUntil("unknown model", 3000);
+    check("wiring: web /model unknown model notes an error, no setModel",
+      client.get().includes("unknown model") && fake1.setModelCalls.length === 1);
+
+    await fake1.commands.get("model")!.handler("p3/m2", c1.ctx);
+    await waitUntil("no API key", 3000);
+    check("wiring: web /model without API key reports failure",
+      client.get().includes("no API key for p3/m2") && fake1.setModelCalls.length === 2);
 
     // session replacement: the OLD closure gets shutdown, a NEW factory
     // invocation gets session_start (exactly what pi does on /new)

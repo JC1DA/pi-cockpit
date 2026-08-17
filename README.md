@@ -34,9 +34,11 @@ in a browser, enter the password, and the session streams live:
   their input and output.
 - The message box sends real pi user messages. While the agent is busy they
   queue as follow-ups; while idle they start a run.
-- The message box also accepts commands: `/new` starts a new session, and
-  `/compact [instructions]` compacts the context (runs immediately, even
-  while busy; results appear as notes in the view).
+- The message box also accepts commands: `/new` starts a new session,
+  `/compact [instructions]` compacts the context, and `/model
+  [provider/model-id]` switches the model (bare `/model` lists the available
+  ones) — all run immediately, even while busy, and results appear as notes in
+  the view.
 - **Stop** in the header interrupts the run, exactly like Esc.
 - **Answer the agent's questions** — when the agent calls
   `ask_user_question` (rpiv-ask-user-question) and a browser is open, the
