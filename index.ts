@@ -224,7 +224,7 @@ var msgs = document.getElementById('msgs'),
     dot = document.getElementById('dot'),
     metaEl = document.getElementById('meta'),
     stopBtn = document.getElementById('stop');
-var curMeta = {}, pendingEl = null, pendingUserEl = null;
+var curMeta = {}, pendingEl = null, userQ = [];
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, function (c) {
@@ -248,6 +248,13 @@ function addMsg(role, html, cls) {
   autoScroll();
   return d;
 }
+function tail(el) {
+  // append at the true end, i.e. before any dashed queued-user bubbles
+  var q = userQ.length ? userQ[0].el : null;
+  if (q) msgs.insertBefore(el, q); else msgs.appendChild(el);
+  autoScroll();
+  return el;
+}
 function addNote(t) {
   var d = document.createElement('div');
   d.className = 'note';
@@ -270,8 +277,7 @@ function toolEl(id, name, state) {
     el = document.createElement('details');
     el.className = 'tool';
     el.id = 'call-' + id;
-    msgs.appendChild(el);
-    autoScroll();
+    tail(el);
   }
   var s = el.querySelector('summary');
   if (!s) {
@@ -285,22 +291,36 @@ function renderEntry(en) {
   if (en.type === 'message' && en.message) {
     var m = en.message;
     if (m.role === 'user') {
-      if (pendingUserEl) { pendingUserEl.remove(); pendingUserEl = null; }
-      addMsg('user', esc(textOf(m.content)));
+      var t = textOf(m.content);
+      var i = 0, hit = null;
+      for (; i < userQ.length; i++) { if (userQ[i].text === t) { hit = userQ[i]; break; } }
+      if (hit) {
+        userQ.splice(i, 1);
+        hit.el.classList.remove('pendinguser');
+      } else {
+        addMsg('user', esc(t));
+      }
     } else if (m.role === 'assistant') {
       var texts = [];
       (Array.isArray(m.content) ? m.content : []).forEach(function (p) {
         if (p.type === 'text') texts.push(p.text || '');
         else if (p.type === 'toolCall') {
           var el = toolEl(p.id, p.name, 'running...');
-          var pre = document.createElement('pre');
-          pre.className = 'in';
-          pre.textContent = 'input: ' + JSON.stringify(p.arguments);
-          el.appendChild(pre);
+          if (!el.querySelector('pre.in')) {
+            var pre = document.createElement('pre');
+            pre.className = 'in';
+            pre.textContent = 'input: ' + JSON.stringify(p.arguments);
+            el.appendChild(pre);
+          }
         }
       });
-      if (pendingEl) { pendingEl.remove(); pendingEl = null; }
-      if (texts.length) addMsg('assistant', esc(texts.join('')));
+      var full = texts.join('');
+      if (pendingEl) {
+        // finalize the streaming bubble in place so it keeps its position
+        if (full) { pendingEl.classList.remove('pending'); pendingEl.textContent = full; }
+        else { pendingEl.remove(); }
+        pendingEl = null;
+      } else if (full) { addMsg('assistant', esc(full)); }
     } else if (m.role === 'toolResult') {
       var out = textOf(m.content);
       var el2 = document.getElementById('call-' + m.toolCallId);
@@ -308,10 +328,12 @@ function renderEntry(en) {
         var s = el2.querySelector('summary');
         if (s) s.textContent = m.toolName + ' — ' + (m.isError ? 'error' : 'done');
         el2.classList.toggle('err', !!m.isError);
-        var pre2 = document.createElement('pre');
-        pre2.className = 'out';
-        pre2.textContent = 'output: ' + out;
-        el2.appendChild(pre2);
+        if (!el2.querySelector('pre.out')) {
+          var pre2 = document.createElement('pre');
+          pre2.className = 'out';
+          pre2.textContent = 'output: ' + out;
+          el2.appendChild(pre2);
+        }
       } else {
         var el3 = document.createElement('details');
         el3.className = 'tool' + (m.isError ? ' err' : '');
@@ -319,7 +341,7 @@ function renderEntry(en) {
         var pre3 = document.createElement('pre');
         pre3.textContent = out;
         el3.appendChild(pre3);
-        msgs.appendChild(el3);
+        tail(el3);
       }
       autoScroll();
     } else if (m.role === 'bashExecution') {
@@ -329,8 +351,7 @@ function renderEntry(en) {
       var pre4 = document.createElement('pre');
       pre4.textContent = m.output || '';
       el4.appendChild(pre4);
-      msgs.appendChild(el4);
-      autoScroll();
+      tail(el4);
     } else if (m.role === 'custom' || m.role === 'customMessage') {
       addNote('note: ' + textOf(m.content).slice(0, 200));
     }
@@ -346,6 +367,8 @@ function renderSnapshot(d) {
   curMeta = d.meta || {};
   updateMetaLine();
   msgs.innerHTML = '';
+  pendingEl = null;
+  userQ = [];
   (d.entries || []).forEach(renderEntry);
   autoScroll();
 }
@@ -358,7 +381,7 @@ es.addEventListener('update', function (e) {
   if (!pendingEl) {
     pendingEl = document.createElement('div');
     pendingEl.className = 'msg assistant pending';
-    msgs.appendChild(pendingEl);
+    tail(pendingEl);
   }
   pendingEl.textContent = textOf(m.content);
   autoScroll();
@@ -377,7 +400,8 @@ function send() {
   var t = input.value.trim();
   if (!t) return;
   input.value = '';
-  pendingUserEl = addMsg('user', esc(t), 'pendinguser');
+  var el = addMsg('user', esc(t), 'pendinguser');
+  userQ.push({ el: el, text: t });
   fetch('/input', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
