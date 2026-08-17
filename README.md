@@ -37,8 +37,10 @@ in a browser, enter the password, and the session streams live:
   `/compact [instructions]` compacts the context (runs immediately, even
   while busy; results appear as notes in the view).
 - **Stop** in the header interrupts the run, exactly like Esc.
-- The header shows session name, model, working directory, and a busy
-  indicator.
+- The header shows session name, model, working directory, a busy indicator,
+  and live context usage (`45k/200k (23%)`, same source as the terminal's
+  `/context`; updates after each run and on model change). On narrow screens
+  (≤640px) the cwd segment hides and the rest wraps.
 
 The server shuts down when pi quits or on `/reload`. It survives session
 replacement (`/new`, `/fork`, same-directory `/resume`) and resyncs every web
@@ -59,10 +61,10 @@ gets its own server (8765, 8766, ...).
 
 ```bash
 npm install               # dev-only type deps
-node selftest.ts          # 62 checks: password, tokens, sanitizer, leaf diff,
-                          # input dispatch, page JS, HTTP protocol, live SSE,
-                          # pi wiring (factory re-run across session replacement,
-                          # /resume cwd policy)
+node selftest.ts          # 71 checks: password, tokens, sanitizer, leaf diff,
+                          # input dispatch, page JS (incl. usage/meta formatting), HTTP protocol,
+                          # live SSE, pi wiring (factory re-run across session replacement,
+                          # usage refresh, /resume cwd policy)
 npx tsc -p tsconfig.json  # strict type check
 ```
 

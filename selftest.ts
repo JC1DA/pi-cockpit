@@ -86,6 +86,53 @@ function check(name: string, cond: boolean): void {
   check("page: no template literals leak into pages",
     !LOGIN_PAGE.includes("`") && !CHAT_PAGE.includes("`") &&
     !LOGIN_PAGE.includes("${") && !CHAT_PAGE.includes("${"));
+
+  const chatScript = scriptOf(CHAT_PAGE)[0] ?? "";
+  const fnSrc = (name: string): string | null => {
+    const i = chatScript.indexOf("function " + name + "(");
+    if (i < 0) return null;
+    const j = chatScript.indexOf("\n}", i);
+    return j < 0 ? null : chatScript.slice(i, j + 2);
+  };
+  type UsageInfo = { tokens: number | null; contextWindow: number; percent: number | null };
+  const fmtSrc = fnSrc("fmtTok");
+  const usageSrc = fnSrc("usageText");
+  const fmtTok = fmtSrc ? (new Function(fmtSrc + "; return fmtTok;")() as (n: number) => string) : null;
+  const usageText = fmtSrc && usageSrc
+    ? (new Function(fmtSrc + "; " + usageSrc + "; return usageText;")() as (u: UsageInfo | null) => string)
+    : null;
+  check("page: fmtTok compacts token counts",
+    !!fmtTok && fmtTok(999) === "999" && fmtTok(45321) === "45k" && fmtTok(200000) === "200k" &&
+    fmtTok(1500000) === "1.5M" && fmtTok(2000000) === "2M");
+  check("page: usageText renders segment, dash for null tokens, empty for no usage",
+    !!usageText && usageText({ tokens: 45321, contextWindow: 200000, percent: 22.66 }) === "45k/200k (23%)" &&
+    usageText({ tokens: null, contextWindow: 200000, percent: null }) === "—/200k" &&
+    usageText(null) === "");
+
+  check("page: mobile CSS wraps meta and hides cwd",
+    CHAT_PAGE.includes("@media (max-width:640px)") && CHAT_PAGE.includes("m-cwd"));
+
+  const metaSegSrc = fnSrc("metaSeg");
+  const upMetaSrc = fnSrc("updateMetaLine");
+  type FakeEl = { children: FakeEl[]; textContent: string; className: string; appendChild(c: FakeEl): void };
+  const fakeEl = (): FakeEl => {
+    const children: FakeEl[] = [];
+    return { children, textContent: "", className: "", appendChild: (c) => { children.push(c); } };
+  };
+  const fakeDoc = { title: "", createElement: () => fakeEl() };
+  const runMeta = (cm: Record<string, unknown>): FakeEl =>
+    (new Function("document", "curMeta", "metaEl",
+      fmtSrc + "\n" + usageSrc + "\n" + metaSegSrc + "\n" + upMetaSrc +
+      "\nupdateMetaLine(); return metaEl;")(fakeDoc, cm, fakeEl()) as FakeEl);
+
+  const el1 = metaSegSrc && upMetaSrc ? runMeta({ sessionName: "s1", model: "p/m", cwd: "/w", usage: { tokens: 45321, contextWindow: 200000, percent: 22.66 } }) : null;
+  check("page: meta line builds segment spans incl. usage",
+    !!el1 && el1.children.length === 4 &&
+    el1.children[0].className === "m m-session" && el1.children[0].textContent === "s1" &&
+    el1.children[3].className === "m m-usage" && el1.children[3].textContent === "45k/200k (23%)");
+  const el2 = metaSegSrc && upMetaSrc ? runMeta({ sessionName: null, model: "", cwd: "/w", usage: null }) : null;
+  check("page: meta line omits usage segment when absent",
+    !!el2 && el2.children.length === 3 && el2.children[0].textContent === "pi session");
 }
 
 // ---------- http server (fake pi api) ----------
@@ -100,7 +147,7 @@ async function httpTests(): Promise<void> {
   const api = {
     getSnapshot: () => ({
       entries: entries.map((e) => sanitizeEntry(e) as AnyRec),
-      meta: { cwd: "/tmp", model: "p/m", sessionName: null, leafId: entries.length ? entries[entries.length - 1].id as string : null },
+      meta: { cwd: "/tmp", model: "p/m", sessionName: null, leafId: entries.length ? entries[entries.length - 1].id as string : null, usage: { tokens: null, contextWindow: 200000, percent: null } },
     }),
     allEntries: () => byId,
     sendInput: async (t: string) => { sent.push(t); return { queued: true }; },
@@ -181,7 +228,7 @@ async function sseTests(): Promise<void> {
   const api = {
     getSnapshot: () => ({
       entries: entries.map((e) => sanitizeEntry(e) as AnyRec),
-      meta: { cwd: "/tmp", model: "p/m", sessionName: null, leafId: entries.length ? entries[entries.length - 1].id as string : null },
+      meta: { cwd: "/tmp", model: "p/m", sessionName: null, leafId: entries.length ? entries[entries.length - 1].id as string : null, usage: { tokens: null, contextWindow: 200000, percent: null } },
     }),
     allEntries: () => byId,
     sendInput: async () => ({ queued: false }),
@@ -216,8 +263,12 @@ async function sseTests(): Promise<void> {
   try {
     await waitUntil("event: snapshot", 3000);
     const m = client.get().match(/event: snapshot\ndata: (.+)/);
-    const snap = m ? (JSON.parse(m[1]) as { entries: unknown[]; meta: { model: string } }) : null;
+    const snap = m ? (JSON.parse(m[1]) as { entries: unknown[]; meta: { model: string; usage: { tokens: number | null; contextWindow: number; percent: number | null } | null } }) : null;
     check("sse: snapshot delivered with 2 entries + meta", !!snap && snap.entries.length === 2 && snap.meta.model === "p/m");
+    check("sse: snapshot meta carries context usage", !!snap && !!snap.meta.usage && snap.meta.usage.contextWindow === 200000);
+    ws.broadcast("meta", { usage: { tokens: 123, contextWindow: 1000, percent: 12 } });
+    await waitUntil('"tokens":123', 3000);
+    check("sse: meta broadcast with usage reaches client", client.get().includes("event: meta") && client.get().includes('"tokens":123'));
     check("sse: retry hint sent", client.get().includes("retry: 2000"));
 
     ws.broadcast("status", { busy: true });
@@ -297,8 +348,10 @@ async function wiringTests(): Promise<void> {
       input(): Promise<string | undefined> { return Promise.resolve(this.passwords.shift()); },
       setStatus(): void {},
     };
+    const usage: { tokens: number | null; contextWindow: number; percent: number | null } = { tokens: null, contextWindow: 200000, percent: null };
     return {
       ui,
+      usage,
       ctx: {
         ui,
         sessionManager: {
@@ -313,6 +366,7 @@ async function wiringTests(): Promise<void> {
         abort(): void {},
         compact(): void {},
         newSession: async () => ({ cancelled: false }),
+        getContextUsage: () => ({ ...usage }),
       },
     };
   };
@@ -360,6 +414,20 @@ async function wiringTests(): Promise<void> {
     const in1 = await fetch(base + "/input", { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify({ text: "before-new" }) });
     check("wiring: /input works on the first session",
       in1.status === 200 && fake1.sent.some((s) => s.text === "before-new"));
+
+    c1.usage.tokens = 45000;
+    c1.usage.percent = 22;
+    fake1.emit("agent_settled", { type: "agent_settled" }, c1.ctx);
+    await waitUntil('"tokens":45000', 3000);
+    check("wiring: agent_settled broadcasts meta with fresh context usage",
+      client.get().includes("event: meta") && client.get().includes('"tokens":45000'));
+
+    c1.usage.tokens = 46000;
+    c1.usage.percent = 23;
+    fake1.emit("model_select", { type: "model_select", model: { provider: "p2", id: "m9" } }, c1.ctx);
+    await waitUntil('"tokens":46000', 3000);
+    check("wiring: model_select rebroadcasts meta with model + fresh usage",
+      client.get().includes('"model":"p2/m9"') && client.get().includes('"tokens":46000'));
 
     await fake1.commands.get("new")!.handler("", c1.ctx);
     await waitUntil("event: note", 3000);

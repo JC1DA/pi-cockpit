@@ -8,7 +8,7 @@
  * Zero runtime dependencies: node:http + node:crypto + node:os + node:fs only.
  * The pi import below is type-only (erased at runtime).
  */
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ContextUsage, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import http from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { networkInterfaces } from "node:os";
@@ -197,7 +197,10 @@ body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 ui-monospace,
 header{display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--panel);border-bottom:1px solid #333}
 header .dot{width:9px;height:9px;border-radius:50%;background:#4ade80;flex:none}
 header .dot.busy{background:#facc15}
-header .meta{color:var(--dim);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+header .meta{display:flex;align-items:baseline;color:var(--dim);font-size:12px;overflow:hidden;white-space:nowrap}
+header .meta .m::before{content:'·';margin:0 8px;color:#555}
+header .meta .m:first-child::before{content:none;margin:0}
+@media (max-width:640px){header .meta{flex-wrap:wrap}header .meta .m{white-space:normal}header .meta .m-cwd{display:none}}
 header button{background:none;border:1px solid #555;color:var(--text);padding:4px 10px;border-radius:6px;cursor:pointer;font:inherit}
 header button#stop{display:none;border-color:#b91c1c}
 header button#stop.show{display:inline-block}
@@ -273,8 +276,27 @@ function addNote(t) {
   msgs.appendChild(d);
   autoScroll();
 }
+function fmtTok(n) {
+  return n >= 1000000 ? (n / 1000000).toFixed(1).replace(".0", "") + "M" : n >= 1000 ? Math.round(n / 1000) + "k" : String(n);
+}
+function usageText(u) {
+  if (!u || !u.contextWindow) return '';
+  return (u.tokens == null ? '—' : fmtTok(u.tokens)) + '/' + fmtTok(u.contextWindow) + (u.percent != null ? ' (' + Math.round(u.percent) + '%)' : '');
+}
+function metaSeg(cls, text) {
+  var s = document.createElement('span');
+  s.className = cls;
+  s.textContent = text;
+  return s;
+}
 function updateMetaLine() {
-  metaEl.textContent = (curMeta.sessionName || 'pi session') + '  ·  ' + (curMeta.model || '') + '  ·  ' + (curMeta.cwd || '');
+  metaEl.textContent = '';
+  var segs = [metaSeg('m m-session', curMeta.sessionName || 'pi session'),
+    metaSeg('m m-model', curMeta.model || ''),
+    metaSeg('m m-cwd', curMeta.cwd || '')];
+  var u = usageText(curMeta.usage);
+  if (u) segs.push(metaSeg('m m-usage', u));
+  for (var i = 0; i < segs.length; i++) metaEl.appendChild(segs[i]);
   if (curMeta.sessionName) document.title = curMeta.sessionName;
 }
 function setBusy(b) {
@@ -405,7 +427,12 @@ es.addEventListener('toolstart', function (e) {
   toolEl(d.id, d.name, 'running...');
 });
 es.addEventListener('status', function (e) { setBusy(!!JSON.parse(e.data).busy); });
-es.addEventListener('meta', function (e) { curMeta.model = JSON.parse(e.data).model || ''; updateMetaLine(); });
+es.addEventListener('meta', function (e) {
+  var d = JSON.parse(e.data);
+  if (d.model !== undefined) curMeta.model = d.model || '';
+  if (d.usage !== undefined) curMeta.usage = d.usage;
+  updateMetaLine();
+});
 es.addEventListener('note', function (e) { addNote(JSON.parse(e.data).text || ''); });
 
 function send() {
@@ -449,6 +476,7 @@ export interface SnapshotMeta {
   model: string;
   sessionName: string | null;
   leafId: string | null;
+  usage: ContextUsage | null;
 }
 
 /** Pi-side dependency seam. Task 7 implements this against a live session. */
@@ -750,6 +778,8 @@ export default function (pi: ExtensionAPI): void {
           model: ctx.model ? (ctx.model as { provider: string; id: string }).provider + "/" + (ctx.model as { provider: string; id: string }).id : "",
           sessionName: sm.getSessionName() ?? null,
           leafId: sm.getLeafId(),
+          // Same source as the terminal's /context: last real assistant usage + estimate for trailing messages.
+          usage: ctx.getContextUsage() ?? null,
         },
       };
     },
@@ -821,14 +851,14 @@ export default function (pi: ExtensionAPI): void {
   });
   pi.on("model_select", (e, ctx) => {
     curCtx = ctx;
-    server?.broadcast("meta", { model: (e.model as { provider: string; id: string }).provider + "/" + (e.model as { provider: string; id: string }).id });
+    server?.broadcast("meta", { model: (e.model as { provider: string; id: string }).provider + "/" + (e.model as { provider: string; id: string }).id, usage: ctx.getContextUsage() ?? null });
     changed();
   });
   pi.on("session_compact", (_e, ctx) => { curCtx = ctx; changed(); });
   pi.on("session_tree", (_e, ctx) => { curCtx = ctx; changed(); });
   pi.on("session_info_changed", (_e, ctx) => { curCtx = ctx; changed(); });
   pi.on("agent_start", (_e, ctx) => { curCtx = ctx; server?.broadcast("status", { busy: true }); });
-  pi.on("agent_settled", (_e, ctx) => { curCtx = ctx; server?.broadcast("status", { busy: false }); });
+  pi.on("agent_settled", (_e, ctx) => { curCtx = ctx; server?.broadcast("status", { busy: false }); server?.broadcast("meta", { usage: ctx.getContextUsage() ?? null }); });
 
   // --- web-side equivalents of built-in commands ---
   // Same names as the TUI built-ins: in the terminal pi checks the built-ins

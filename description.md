@@ -41,6 +41,11 @@ from another machine on your LAN and type messages back into the agent.
   Other `/`-prefixed input follows terminal semantics (skills, prompt
   templates; unknown text goes to the model as literal text).
 - The **Stop** button in the web header behaves like Esc in the terminal.
+- The header also shows live context usage as `45k/200k (23%)` — current context
+  tokens / the model's context window / percent (same source as the terminal's
+  `/context`). It updates after each agent run and on model change, and reads
+  `—` right after `/compact` until the next assistant response. On narrow
+  screens (≤640px) the working-directory segment is hidden and the rest wraps.
 - The server stops when pi quits or on `/reload`. It survives session
   replacement (`/new`, `/fork`, same-directory `/resume`) and resyncs every web
   client to the new session. A cross-directory `/resume` makes pi re-import the
@@ -51,7 +56,8 @@ from another machine on your LAN and type messages back into the agent.
 ## Tests
 - `npm install` (dev-only type deps), then:
   - `node selftest.ts` — unit + HTTP-protocol checks (password, tokens/cookie,
-    sanitizer, leaf diff, page syntax, full server against a fake pi api).
+    sanitizer, leaf diff, page syntax + usage/meta formatting, full server
+    against a fake pi api).
   - `npx tsc -p tsconfig.json` — strict type check.
 - Manual e2e checklist: `pi -e ./index.ts` → `/webserve start` → login in a
   browser → watch live streaming → send a message from the web (appears in the
