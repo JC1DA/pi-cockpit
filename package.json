@@ -1,0 +1,11 @@
+{
+  "name": "remote-pi-ext",
+  "private": true,
+  "type": "module",
+  "pi": { "extensions": ["./index.ts"] },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^22.0.0",
+    "@earendil-works/pi-coding-agent": "^0.84.2"
+  }
+}
