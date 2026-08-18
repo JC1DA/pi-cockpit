@@ -34,6 +34,9 @@ in a browser, enter the password, and the session streams live:
   finalizes: headings, lists, quotes, bold/code/links, and fenced code blocks
   with a copy button (links open in a new tab; only http/https/mailto URLs
   become links); tool calls render as cards with their input and output.
+- **Thinking** — with reasoning models, the model's thinking streams dimmed
+  in the live bubble and folds into a collapsed 💭 block above the finalized
+  answer (click to expand).
 - The message box sends real pi user messages. While the agent is busy,
   Send steers the running agent (like Enter in the terminal); while idle it
   starts a run. Messages always end up in chronological order above their

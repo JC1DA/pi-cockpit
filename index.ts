@@ -514,6 +514,11 @@ header button#notif.on{opacity:1;border-color:#60a5fa}
 .msg.md .clang{position:absolute;top:4px;left:8px;color:#555;font-size:11px}
 .msg.md .copybtn{position:absolute;top:4px;right:4px;background:#2a2a30;border:1px solid #444;color:var(--dim);border-radius:4px;padding:1px 6px;font-size:11px;cursor:pointer}
 .msg.md .copybtn:hover{color:var(--text)}
+.msg .thinklive{color:var(--dim);font-style:italic}
+.msg .thinkbox{margin:0 0 6px}
+.msg .thinkbox:last-child{margin-bottom:0}
+.msg .thinkbox summary{cursor:pointer;color:var(--dim);font-size:12px}
+.msg .thinkbox pre{margin:4px 0 0;padding:6px 8px;background:#0d0d0f;border:1px solid #333;border-radius:6px;white-space:pre-wrap;font-size:12px;color:var(--dim);font-style:italic}
 details.tool{align-self:flex-start;max-width:85%;background:var(--tool);border:1px solid #333;border-radius:8px;padding:4px 8px}
 details.tool.err{border-color:#b91c1c}
 details.tool summary{cursor:pointer;color:var(--dim);font-size:12px}
@@ -573,7 +578,7 @@ var msgs = document.getElementById('msgs'),
     dot = document.getElementById('dot'),
     metaEl = document.getElementById('meta'),
     stopBtn = document.getElementById('stop');
-var curMeta = {}, pendingEl = null, userQ = [];
+var curMeta = {}, pendingEl = null, pendingThinkEl = null, pendingTxtEl = null, userQ = [];
 var busy = false, notifOn = false;
 
 // --- image attachments: 📎 button, paste, or drag & drop onto the input ---
@@ -647,6 +652,11 @@ function textOf(c) {
   if (typeof c === 'string') return c;
   if (Array.isArray(c)) return c.filter(function (x) { return x && x.type === 'text'; })
     .map(function (x) { return x.text || ''; }).join('');
+  return '';
+}
+function thinkingOf(c) {
+  if (Array.isArray(c)) return c.filter(function (x) { return x && x.type === 'thinking'; })
+    .map(function (x) { return x.thinking || ''; }).join('');
   return '';
 }
 // --- markdown rendering for assistant text (applied on finalize, not per
@@ -724,6 +734,12 @@ function md(src) {
   flushAll();
   return out.join("");
 }
+// collapsed reasoning block shown above a finalized answer; esc() first, as
+// always, so model output can never inject HTML
+function thinkHtml(t) {
+  if (!t) return '';
+  return '<details class="thinkbox"><summary>💭 thinking · ' + t.length + ' chars</summary><pre>' + esc(t) + '</pre></details>';
+}
 function addMsg(role, html, cls) {
   var d = document.createElement('div');
   d.className = 'msg ' + role + (cls ? ' ' + cls : '');
@@ -782,7 +798,14 @@ function notifyDone() {
     var name = curMeta.sessionName || 'pi session';
     var body = '';
     var els = msgs.querySelectorAll('.msg.assistant.md');
-    if (els.length > 0) body = (els[els.length - 1].textContent || '').slice(0, 150);
+    if (els.length > 0) {
+      // clone and drop the thinking block so the snippet is the answer, not
+      // the reasoning (a hidden <details> body is still textContent)
+      var last = els[els.length - 1].cloneNode(true);
+      var tb = last.querySelector('.thinkbox');
+      if (tb) tb.remove();
+      body = (last.textContent || '').slice(0, 150);
+    }
     var n = new Notification('pi: ' + name, body ? { body: body } : undefined);
     n.onclick = function () { window.focus(); n.close(); };
   } catch (e) {}
@@ -849,13 +872,15 @@ function renderEntry(en) {
         }
       });
       var full = texts.join('');
+      var think = thinkingOf(m.content);
       if (pendingEl) {
         // finalize the streaming bubble in place so it keeps its position;
-        // swap the raw streaming text for rendered markdown
-        if (full) { pendingEl.classList.remove('pending'); pendingEl.classList.add('md'); pendingEl.innerHTML = md(full); }
+        // swap the raw streaming text for rendered markdown, with a collapsed
+        // thinking block above it when the model thought before answering
+        if (full || think) { pendingEl.classList.remove('pending'); pendingEl.classList.add('md'); pendingEl.innerHTML = thinkHtml(think) + md(full); }
         else { pendingEl.remove(); }
-        pendingEl = null;
-      } else if (full) { addMsg('assistant', md(full), 'md'); }
+        pendingEl = pendingThinkEl = pendingTxtEl = null;
+      } else if (full || think) { addMsg('assistant', thinkHtml(think) + md(full), 'md'); }
     } else if (m.role === 'toolResult') {
       var out = textOf(m.content);
       // ask bridge: pi flags blocked calls isError, but an answered/declined
@@ -907,7 +932,7 @@ function renderSnapshot(d) {
   curMeta = d.meta || {};
   updateMetaLine();
   msgs.innerHTML = '';
-  pendingEl = null;
+  pendingEl = pendingThinkEl = pendingTxtEl = null;
   userQ = [];
   (d.entries || []).forEach(renderEntry);
   autoScroll();
@@ -921,9 +946,22 @@ es.addEventListener('update', function (e) {
   if (!pendingEl) {
     pendingEl = document.createElement('div');
     pendingEl.className = 'msg assistant pending';
+    // two children: the streaming thinking (dimmed, only visible while the
+    // model has produced any) and the streaming text. pi sends accumulated
+    // partials, so each update replaces both.
+    pendingThinkEl = document.createElement('div');
+    pendingThinkEl.className = 'thinklive';
+    pendingThinkEl.style.display = 'none';
+    pendingEl.appendChild(pendingThinkEl);
+    pendingTxtEl = document.createElement('div');
+    pendingTxtEl.className = 'txt';
+    pendingEl.appendChild(pendingTxtEl);
     tail(pendingEl);
   }
-  pendingEl.textContent = textOf(m.content);
+  var th = thinkingOf(m.content), tx = textOf(m.content);
+  pendingThinkEl.style.display = th ? '' : 'none';
+  pendingThinkEl.textContent = th;
+  pendingTxtEl.textContent = tx;
   autoScroll();
 });
 es.addEventListener('append', function (e) {

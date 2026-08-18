@@ -179,7 +179,7 @@ function check(name: string, cond: boolean): void {
     (C as unknown as { permission: string }).permission = permission;
     (new Function("notifOn", "document", "Notification", "curMeta", "msgs",
       ndSrc + "\nnotifyDone();"))(on, { hidden }, C, { sessionName: "s1" },
-      { querySelectorAll: () => [{ textContent: "All done — tests pass" }] });
+      { querySelectorAll: () => [{ textContent: "All done — tests pass", cloneNode: () => ({ textContent: "All done — tests pass", querySelector: () => null }) }] });
     return calls;
   };
   check("notify: hidden tab + granted + on fires one notification with name and last-assistant snippet",
@@ -225,9 +225,9 @@ function check(name: string, cond: boolean): void {
   check("md: unclosed fence still shows the code",
     !!md && md("```js\nconst a = 1;").includes("<pre>const a = 1;</pre>"));
   check("page: assistant finalize renders markdown; streaming stays plain text",
-    CHAT_PAGE.includes("pendingEl.innerHTML = md(full)") &&
-    CHAT_PAGE.includes("addMsg('assistant', md(full), 'md')") &&
-    CHAT_PAGE.includes("pendingEl.textContent = textOf(m.content)"));
+    CHAT_PAGE.includes("pendingEl.innerHTML = thinkHtml(think) + md(full)") &&
+    CHAT_PAGE.includes("addMsg('assistant', thinkHtml(think) + md(full), 'md')") &&
+    CHAT_PAGE.includes("pendingTxtEl.textContent = tx"));
   check("page: codebox copy button wired (clipboard + execCommand fallback)",
     CHAT_PAGE.includes("copybtn") && CHAT_PAGE.includes("execCommand('copy')"));
 }
@@ -1127,6 +1127,27 @@ async function clientOrderingTest(): Promise<void> {
     idxAsst >= 0 && kids[idxAsst]._text === "<p>done</p>");
   check("client: no pending bubbles left after the run",
     handles.userQ().length === 0 && handles.pendingEl() === null);
+
+  // --- thinking: pi streams thinking deltas BEFORE the answer text ---
+  idOf("input")!.value = "think out loud";
+  handles.send();
+  fire("status", { busy: true });
+  fire("update", { role: "assistant", content: [{ type: "thinking", thinking: "let me think" }] });
+  const pend = handles.pendingEl() as E;
+  check("client: thinking-only updates stream dimmed in the pending bubble",
+    !!pend && (pend.children as E[]).some((c) => c.className === "thinklive" && c._text === "let me think" && c.style.display !== "none"));
+  fire("update", { role: "assistant", content: [{ type: "thinking", thinking: "let me think harder" }, { type: "text", text: "now" }] });
+  check("client: text streams beside the thinking in the pending bubble",
+    !!handles.pendingEl() && ((handles.pendingEl() as E).children as E[]).some((c) => c.className === "txt" && c._text === "now"));
+  fire("append", { entries: [{ type: "message", id: "mU2", parentId: "e0", timestamp: "4", message: { role: "user", content: [{ type: "text", text: "think out loud" }] } }] });
+  fire("status", { busy: false });
+  fire("append", { entries: [{ type: "message", id: "mA2", parentId: "mU2", timestamp: "5", message: { role: "assistant", content: [{ type: "thinking", thinking: "full reasoning here" }, { type: "text", text: "the answer" }] } }] });
+  const kids2 = handles.msgs().children as E[];
+  const idxA2 = kids2.findIndex((k) => k.className === "msg assistant md" && (k._text as string).includes("the answer"));
+  check("client: finalized answer keeps a collapsed thinking block above it",
+    idxA2 >= 0 && (kids2[idxA2]._text as string).startsWith('<details class="thinkbox">') && (kids2[idxA2]._text as string).includes("full reasoning here"));
+  check("client: no pending bubbles left after the thinking run",
+    handles.pendingEl() === null);
 }
 
 await clientOrderingTest();

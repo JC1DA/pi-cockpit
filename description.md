@@ -8,7 +8,9 @@ Starts a password-protected web server that streams the current pi session
 markers) to a browser via Server-Sent Events, so you can watch the agent work
 from another machine on your LAN and type messages back into the agent.
 Assistant text renders as markdown (headings, lists, quotes, code, links,
-fenced code blocks with a copy button); user messages stay literal.
+fenced code blocks with a copy button); user messages stay literal. When the
+model thinks, the reasoning streams dimmed and folds into a collapsed block
+above the answer.
 
 ## Commands
 - `/webserve start [port]` — asks for a password (min 4 chars), starts the server
@@ -39,7 +41,10 @@ fenced code blocks with a copy button); user messages stay literal.
   streaming it shows as plain text and switches to rendered markdown when it
   finalizes; code blocks get a copy button (clipboard API, with an
   execCommand fallback for plain-HTTP contexts), and links open in a new
-  tab (only http/https/mailto URLs become links).
+  tab (only http/https/mailto URLs become links). Reasoning models: the
+  thinking streams dimmed in the pending bubble while it happens, and on
+  finalize folds into a collapsed 💭 block above the answer (click to
+  expand); non-reasoning models render exactly as before.
 - Messages sent from the web appear in the terminal exactly as if typed there.
   While the agent is busy, Send steers the running agent (terminal Enter
   parity); while idle it starts a run. The web has no queue path — the
@@ -105,10 +110,11 @@ fenced code blocks with a copy button); user messages stay literal.
 
 ## Tests
 - `npm install` (dev-only type deps), then:
-  - `node selftest.ts` — 156 unit + HTTP-protocol checks (password,
+  - `node selftest.ts` — 160 unit + HTTP-protocol checks (password,
     tokens/cookie, sanitizer, leaf diff, page syntax + usage/meta formatting,
     tab-title ⏳ prefix, finish-notification decision matrix, image upload:
-    /input size caps + MIME/count validation, page attach UI, full server
+    /input size caps + MIME/count validation, page attach UI, thinking stream
+    + collapsed finalize, full server
     against a fake pi api, ask bridge: envelope wording, TUI component,
     HTTP ask flow, tool_call hook wiring — first-answer-wins, decline,
     duplicate 409, client-left fallback, agent_settled trailing-entry flush,
@@ -118,7 +124,9 @@ fenced code blocks with a copy button); user messages stay literal.
 - Manual e2e checklist: `pi -e ./index.ts` → `/webserve start` → login in a
   browser → watch live streaming → send a message from the web (appears in the
   TUI) → attach an image (📎, paste, or drag & drop) and send it (thumbnail
-  shows in the view; the model sees it if vision-capable) → `/compact` and
+  shows in the view; the model sees it if vision-capable) → with a
+  reasoning model at thinking level ≥ low, watch the dimmed thinking stream
+  and the collapsed 💭 block on the finalized answer → `/compact` and
   `/new` from the web (new session shows in the view) →
   ask the agent an ambiguous question to trigger `ask_user_question` → answer
   from the web modal (agent continues with the answer; also try answering in
