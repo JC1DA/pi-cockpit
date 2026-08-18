@@ -43,10 +43,11 @@ and folds into a collapsed block above the answer.
   streaming it shows as plain text and switches to rendered markdown when it
   finalizes; code blocks get a copy button (clipboard API, with an
   execCommand fallback for plain-HTTP contexts), and links open in a new
-  tab (only http/https/mailto URLs become links). Reasoning models: the
-  thinking streams dimmed in the pending bubble while it happens, and on
-  finalize folds into a collapsed 💭 block above the answer (click to
-  expand); non-reasoning models render exactly as before.
+  tab (only http/https/mailto URLs become links). Reasoning models: while the model
+  thinks, the reasoning streams into a collapsed 💭 box in the pending bubble
+  (a dimmed "💭 thinking · N chars" line — click to expand and watch it
+  stream live); on finalize it folds into the same collapsed 💭 block above
+  the answer (click to expand). Non-reasoning models render exactly as before.
 - Messages sent from the web appear in the terminal exactly as if typed there.
   While the agent is busy, Send steers the running agent (terminal Enter
   parity); while idle it starts a run. The web has no queue path — the
@@ -176,8 +177,9 @@ and folds into a collapsed block above the answer.
   `! ls` output is in the agent's next context, `!! env` is not) →
   attach an image (📎, paste, or drag & drop) and send it (thumbnail
   shows in the view; the model sees it if vision-capable) → with a
-  reasoning model at thinking level ≥ low, watch the dimmed thinking stream
-  and the collapsed 💭 block on the finalized answer → `/compact` and
+  reasoning model at thinking level ≥ low, watch the collapsed 💭 box stream
+  in (expand it to watch the live reasoning) and fold into the 💭 block above
+  the finalized answer → `/compact` and
   `/new` from the web (new session shows in the view) →
   ask the agent an ambiguous question to trigger `ask_user_question` → answer
   from the web modal (agent continues with the answer; also try answering in

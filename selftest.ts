@@ -1399,8 +1399,12 @@ async function clientOrderingTest(): Promise<void> {
   fire("status", { busy: true });
   fire("update", { role: "assistant", content: [{ type: "thinking", thinking: "let me think" }] });
   const pend = handles.pendingEl() as E;
-  check("client: thinking-only updates stream dimmed in the pending bubble",
-    !!pend && (pend.children as E[]).some((c) => c.className === "thinklive" && c._text === "let me think" && c.style.display !== "none"));
+  check("client: thinking-only updates stream into a collapsed box in the pending bubble",
+    !!pend && (pend.children as E[]).some((c) =>
+      c.className === "thinkbox" && c.style.display !== "none" &&
+      c.children.length === 2 &&
+      c.children[0]._text === "💭 thinking · 12 chars" &&
+      c.children[1]._text === "let me think"));
   fire("update", { role: "assistant", content: [{ type: "thinking", thinking: "let me think harder" }, { type: "text", text: "now" }] });
   check("client: text streams beside the thinking in the pending bubble",
     !!handles.pendingEl() && ((handles.pendingEl() as E).children as E[]).some((c) => c.className === "txt" && c._text === "now"));

@@ -697,7 +697,6 @@ header button#notif.on{opacity:1;border-color:#60a5fa}
 .msg.md .clang{position:absolute;top:4px;left:8px;color:#555;font-size:11px}
 .msg.md .copybtn{position:absolute;top:4px;right:4px;background:#2a2a30;border:1px solid #444;color:var(--dim);border-radius:4px;padding:1px 6px;font-size:11px;cursor:pointer}
 .msg.md .copybtn:hover{color:var(--text)}
-.msg .thinklive{color:var(--dim);font-style:italic}
 .msg .thinkbox{margin:0 0 6px}
 .msg .thinkbox:last-child{margin-bottom:0}
 .msg .thinkbox summary{cursor:pointer;color:var(--dim);font-size:12px}
@@ -775,7 +774,7 @@ var msgs = document.getElementById('msgs'),
     dot = document.getElementById('dot'),
     metaEl = document.getElementById('meta'),
     stopBtn = document.getElementById('stop');
-var curMeta = {}, pendingEl = null, pendingThinkEl = null, pendingTxtEl = null, userQ = [];
+var curMeta = {}, pendingEl = null, pendingThinkEl = null, pendingThinkSum = null, pendingThinkBody = null, pendingTxtEl = null, userQ = [];
 var busy = false, notifOn = false;
 // registered extension commands (kept in sync with the pi.registerCommand
 // list in the extension; the selftest asserts it): they execute immediately
@@ -1094,7 +1093,7 @@ function renderEntry(en) {
         // thinking block above it when the model thought before answering
         if (full || think) { pendingEl.classList.remove('pending'); pendingEl.classList.add('md'); pendingEl.innerHTML = thinkHtml(think) + md(full); }
         else { pendingEl.remove(); }
-        pendingEl = pendingThinkEl = pendingTxtEl = null;
+        pendingEl = pendingThinkEl = pendingThinkSum = pendingThinkBody = pendingTxtEl = null;
       } else if (full || think) { addMsg('assistant', thinkHtml(think) + md(full), 'md'); }
     } else if (m.role === 'toolResult') {
       var out = textOf(m.content);
@@ -1165,7 +1164,7 @@ function renderSnapshot(d) {
   curMeta = d.meta || {};
   updateMetaLine();
   msgs.innerHTML = '';
-  pendingEl = pendingThinkEl = pendingTxtEl = null;
+  pendingEl = pendingThinkEl = pendingThinkSum = pendingThinkBody = pendingTxtEl = null;
   userQ = [];
   (d.entries || []).forEach(renderEntry);
   autoScroll();
@@ -1179,12 +1178,16 @@ es.addEventListener('update', function (e) {
   if (!pendingEl) {
     pendingEl = document.createElement('div');
     pendingEl.className = 'msg assistant pending';
-    // two children: the streaming thinking (dimmed, only visible while the
-    // model has produced any) and the streaming text. pi sends accumulated
-    // partials, so each update replaces both.
-    pendingThinkEl = document.createElement('div');
-    pendingThinkEl.className = 'thinklive';
+    // two children: the streaming thinking (collapsed 💭 box, same shape as
+    // the finalized block — expand to watch it live) and the streaming text.
+    // pi sends accumulated partials, so each update replaces both.
+    pendingThinkEl = document.createElement('details');
+    pendingThinkEl.className = 'thinkbox';
     pendingThinkEl.style.display = 'none';
+    pendingThinkSum = document.createElement('summary');
+    pendingThinkBody = document.createElement('pre');
+    pendingThinkEl.appendChild(pendingThinkSum);
+    pendingThinkEl.appendChild(pendingThinkBody);
     pendingEl.appendChild(pendingThinkEl);
     pendingTxtEl = document.createElement('div');
     pendingTxtEl.className = 'txt';
@@ -1193,7 +1196,10 @@ es.addEventListener('update', function (e) {
   }
   var th = thinkingOf(m.content), tx = textOf(m.content);
   pendingThinkEl.style.display = th ? '' : 'none';
-  pendingThinkEl.textContent = th;
+  if (th) {
+    pendingThinkSum.textContent = '💭 thinking · ' + th.length + ' chars';
+    pendingThinkBody.textContent = th;
+  }
   pendingTxtEl.textContent = tx;
   autoScroll();
 });
