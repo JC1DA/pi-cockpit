@@ -1,6 +1,6 @@
 {
   "name": "remote-pi-ext",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Browse and drive the current pi session from a web browser: live SSE streaming, messages, steering, web ! bash, image attach, and ask-user-question bridge.",
   "type": "module",
   "license": "MIT",

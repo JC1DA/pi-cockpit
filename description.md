@@ -140,6 +140,18 @@ and folds into a collapsed block above the answer.
   `/context`). It updates after each agent run and on model change, and reads
   `—` right after `/compact` until the next assistant response. On narrow
   screens (≤640px) the working-directory segment is hidden and the rest wraps.
+- **Cost meter** — the header also shows the session cost (`$1.23`): the sum of
+  `usage.cost.total` over every session entry — assistant messages, toolResult
+  usage, compaction and branch-summary usage — the same source as the
+  terminal's `/session` stats, so the figure matches what pi reports, including
+  compacted history (aborted calls count when the provider reported usage,
+  since partial output is billed). It updates with the same `meta` broadcast as
+  the usage (after each run and on model change) and is present in every
+  snapshot/resync. Each finalized answer bubble is additionally tagged with its
+  own LLM call's cost; a toolCall-only message renders no bubble, so its cost
+  appears only in the header total. Unpriced models (e.g. local) produce no
+  cost number, and nothing is shown — the meter hides itself rather than
+  displaying $0.
 - **Tool-output toolbar** — a thin bar above the messages has a filter
   dropdown (`All` / `Errors only` / `Hidden`) and a `Collapse all` toggle. The
   filter is a single body class that CSS uses to gate every tool card (current
@@ -156,9 +168,11 @@ and folds into a collapsed block above the answer.
 
 ## Tests
 - `npm install` (dev-only type deps), then:
-  - `node selftest.ts` — 223 unit + HTTP-protocol checks (password,
-    tokens/cookie, sanitizer, leaf diff, page syntax + usage/meta formatting,
-    tab-title ⏳ prefix, finish-notification decision matrix, image upload:
+  - `node selftest.ts` — 231 unit + HTTP-protocol checks (password,
+    tokens/cookie, sanitizer, leaf diff, session cost: usage sources (assistant,
+    toolResult, compaction, branch_summary), zero/negative/malformed safety,
+    page syntax + usage/cost formatting, tab-title ⏳ prefix,
+    finish-notification decision matrix, image upload:
     /input size caps + MIME/count validation, page attach UI, thinking stream
     + collapsed finalize, web ! bash: parser, output cleaning, tail
     truncation + full-output temp file, real-shell runs, SSE streaming,
@@ -184,7 +198,9 @@ and folds into a collapsed block above the answer.
   `/new` from the web (new session shows in the view) →
   ask the agent an ambiguous question to trigger `ask_user_question` → answer
   from the web modal (agent continues with the answer; also try answering in
-  the terminal, and with both open at once — first answer wins) → click 🔔
+  the terminal, and with both open at once — first answer wins) → with a
+  priced model, check the header shows the session cost and finalized answers
+  carry a per-call cost tag → click 🔔
   (allow), send a message, and hide the tab — a notification arrives when the
   run finishes (on plain-HTTP LAN the 🔔 is hidden; instead the tab title
   shows ⏳ while busy) → Stop mid-run → `/webserve stop` → second terminal

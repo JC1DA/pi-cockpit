@@ -150,6 +150,31 @@ export function diffLeaf(
   return { kind: "append", entries: path };
 }
 
+/**
+ * Total USD cost of a session: sum of usage.cost.total over every entry that
+ * reports it — compaction/branch_summary entry usage, assistant messages, and
+ * toolResult usage — the same sources pi's own getSessionStats() aggregates,
+ * so the web figure matches the terminal's /session stats. Aggregates over ALL
+ * entries (including compacted history); aborted calls count when the
+ * provider reported usage, since partial output is billed. Defensive on
+ * purpose: malformed or usage-less entries contribute 0, never throw.
+ */
+export function sessionCost(entries: AnyRec[]): number {
+  let total = 0;
+  for (const e of entries) {
+    let u: AnyRec | undefined;
+    if (e.type === "compaction" || e.type === "branch_summary") {
+      u = e.usage as AnyRec | undefined;
+    } else if (e.type === "message") {
+      const m = e.message as AnyRec | undefined;
+      if (m && (m.role === "assistant" || m.role === "toolResult")) u = m.usage as AnyRec | undefined;
+    }
+    const c = u?.cost as AnyRec | undefined;
+    if (c && typeof c.total === "number" && c.total > 0) total += c.total;
+  }
+  return total;
+}
+
 // Delivery options for user input (TUI parity). "/" input keeps the proven
 // command path: registered commands execute immediately (even while streaming),
 // skills/prompt templates expand, delivery is followUp while busy. Chat
@@ -670,6 +695,7 @@ header .dot.busy{background:#facc15}
 header .meta{display:flex;align-items:baseline;color:var(--dim);font-size:12px;overflow:hidden;white-space:nowrap}
 header .meta .m::before{content:'·';margin:0 8px;color:#555}
 header .meta .m:first-child::before{content:none;margin:0}
+header .meta .m-cost{color:var(--text)}
 @media (max-width:640px){header .meta{flex-wrap:wrap}header .meta .m{white-space:normal}header .meta .m-cwd{display:none}}
 header button{background:none;border:1px solid #555;color:var(--text);padding:4px 10px;border-radius:6px;cursor:pointer;font:inherit}
 header button#stop{display:none;border-color:#b91c1c}
@@ -701,6 +727,7 @@ header button#notif.on{opacity:1;border-color:#60a5fa}
 .msg .thinkbox:last-child{margin-bottom:0}
 .msg .thinkbox summary{cursor:pointer;color:var(--dim);font-size:12px}
 .msg .thinkbox pre{margin:4px 0 0;padding:6px 8px;background:#0d0d0f;border:1px solid #333;border-radius:6px;white-space:pre-wrap;font-size:12px;color:var(--dim);font-style:italic}
+.msg .m-cost{display:block;margin-top:6px;text-align:right;color:var(--dim);font-size:11px}
 details.tool{align-self:flex-start;max-width:85%;background:var(--tool);border:1px solid #333;border-radius:8px;padding:4px 8px}
 details.tool.err{border-color:#b91c1c}
 details.tool summary{cursor:pointer;color:var(--dim);font-size:12px}
@@ -963,6 +990,11 @@ function addNote(t) {
 function fmtTok(n) {
   return n >= 1000000 ? (n / 1000000).toFixed(1).replace(".0", "") + "M" : n >= 1000 ? Math.round(n / 1000) + "k" : String(n);
 }
+function fmtCost(c) {
+  if (typeof c !== 'number' || !(c > 0)) return '';
+  var d = c < 0.01 ? (c < 0.001 ? 4 : 3) : 2;
+  return '$' + c.toFixed(d);
+}
 function usageText(u) {
   if (!u || !u.contextWindow) return '';
   return (u.tokens == null ? '—' : fmtTok(u.tokens)) + '/' + fmtTok(u.contextWindow) + (u.percent != null ? ' (' + Math.round(u.percent) + '%)' : '');
@@ -980,6 +1012,8 @@ function updateMetaLine() {
     metaSeg('m m-cwd', curMeta.cwd || '')];
   var u = usageText(curMeta.usage);
   if (u) segs.push(metaSeg('m m-usage', u));
+  var c = fmtCost(curMeta.cost);
+  if (c) segs.push(metaSeg('m m-cost', c));
   for (var i = 0; i < segs.length; i++) metaEl.appendChild(segs[i]);
   document.title = (busy ? '⏳ ' : '') + (curMeta.sessionName || 'pi session');
 }
@@ -1074,14 +1108,20 @@ function renderEntry(en) {
       });
       var full = texts.join('');
       var think = thinkingOf(m.content);
+      // The finalized entry carries the LLM call's usage: tag the bubble with
+      // its cost. ToolCall-only messages (no text/thinking) render no bubble,
+      // so their cost appears only in the header total.
+      var costHtml = '';
+      var ct = m.usage && m.usage.cost ? m.usage.cost.total : 0;
+      if (typeof ct === 'number' && ct > 0) costHtml = '<span class="m-cost">' + fmtCost(ct) + '</span>';
       if (pendingEl) {
         // finalize the streaming bubble in place so it keeps its position;
         // swap the raw streaming text for rendered markdown, with a collapsed
         // thinking block above it when the model thought before answering
-        if (full || think) { pendingEl.classList.remove('pending'); pendingEl.classList.add('md'); pendingEl.innerHTML = thinkHtml(think) + md(full); }
+        if (full || think) { pendingEl.classList.remove('pending'); pendingEl.classList.add('md'); pendingEl.innerHTML = thinkHtml(think) + md(full) + costHtml; }
         else { pendingEl.remove(); }
         pendingEl = pendingThinkEl = pendingThinkSum = pendingThinkBody = pendingTxtEl = null;
-      } else if (full || think) { addMsg('assistant', thinkHtml(think) + md(full), 'md'); }
+      } else if (full || think) { addMsg('assistant', thinkHtml(think) + md(full) + costHtml, 'md'); }
     } else if (m.role === 'toolResult') {
       var out = textOf(m.content);
       // ask bridge: pi flags blocked calls isError, but an answered/declined
@@ -1233,6 +1273,7 @@ es.addEventListener('meta', function (e) {
   var d = JSON.parse(e.data);
   if (d.model !== undefined) curMeta.model = d.model || '';
   if (d.usage !== undefined) curMeta.usage = d.usage;
+  if (d.cost !== undefined) curMeta.cost = d.cost;
   updateMetaLine();
 });
 es.addEventListener('note', function (e) { addNote(JSON.parse(e.data).text || ''); });
@@ -2103,6 +2144,10 @@ export default function (pi: ExtensionAPI): void {
           leafId: sm.getLeafId(),
           // Same source as the terminal's /context: last real assistant usage + estimate for trailing messages.
           usage: ctx.getContextUsage() ?? null,
+          // Session cost, same source as the terminal's /session stats: every
+          // entry, including compacted history (getEntries, not
+          // buildContextEntries — the entry list above is the context view).
+          cost: sessionCost(sm.getEntries() as unknown as AnyRec[]),
         },
       };
     },
@@ -2264,7 +2309,7 @@ export default function (pi: ExtensionAPI): void {
   });
   pi.on("model_select", (e, ctx) => {
     curCtx = ctx;
-    server?.broadcast("meta", { model: (e.model as { provider: string; id: string }).provider + "/" + (e.model as { provider: string; id: string }).id, usage: ctx.getContextUsage() ?? null });
+    server?.broadcast("meta", { model: (e.model as { provider: string; id: string }).provider + "/" + (e.model as { provider: string; id: string }).id, usage: ctx.getContextUsage() ?? null, cost: sessionCost(ctx.sessionManager.getEntries() as unknown as AnyRec[]) });
     changed();
   });
   pi.on("session_compact", (_e, ctx) => { curCtx = ctx; changed(); });
@@ -2274,7 +2319,7 @@ export default function (pi: ExtensionAPI): void {
   pi.on("agent_settled", (_e, ctx) => {
     curCtx = ctx;
     server?.broadcast("status", { busy: false });
-    server?.broadcast("meta", { usage: ctx.getContextUsage() ?? null });
+    server?.broadcast("meta", { usage: ctx.getContextUsage() ?? null, cost: sessionCost(ctx.sessionManager.getEntries() as unknown as AnyRec[]) });
     // pi persists each message after its message_end handlers ran, so the run's
     // trailing entry was one leaf behind; the run is fully settled and persisted
     // now, so flush it and let the final message finalize as markdown without

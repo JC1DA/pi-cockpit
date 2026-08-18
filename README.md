@@ -82,8 +82,12 @@ in a browser, enter the password, and the session streams live:
   first wins, the other surface closes, and the agent continues with it.
 - The header shows session name, model, working directory, a busy indicator,
   and live context usage (`45k/200k (23%)`, same source as the terminal's
-  `/context`; updates after each run and on model change). On narrow screens
-  (≤640px) the cwd segment hides and the rest wraps.
+  `/context`; updates after each run and on model change). It also shows the
+  session cost (`$1.23`) — same source as the terminal's `/session` stats,
+  i.e. the sum of `usage.cost.total` over every entry including compacted
+  history; each finalized answer is tagged with its own LLM call's cost. With
+  unpriced models (e.g. local) nothing is shown. On narrow screens (≤640px)
+  the cwd segment hides and the rest wraps.
 
 The server shuts down when pi quits or on `/reload`. It survives session
 replacement (`/new`, `/fork`, same-directory `/resume`) and resyncs every web
@@ -104,14 +108,14 @@ gets its own server (8765, 8766, ...).
 
 ```bash
 npm install               # dev-only type deps
-node selftest.ts          # 207 checks: password, tokens, sanitizer, leaf diff,
+node selftest.ts          # 231 checks: password, tokens, sanitizer, leaf diff,
                           # input dispatch, web ! bash (parser, output cleaning, truncation +
                           # full-output file, real-shell runs, SSE streaming, session
                           # recording, agent-context injection, one-at-a-time), page JS (incl.
-                          # usage/meta formatting, tab-title prefix, finish notifications,
+                          # usage/cost formatting, tab-title prefix, finish notifications,
                           # markdown rendering), HTTP protocol, live SSE, pi wiring (factory
-                          # re-run across session replacement, usage refresh, /resume cwd
-                          # policy), ask bridge (envelope wording, TUI component, HTTP ask
+                          # re-run across session replacement, usage + cost refresh, /resume
+                          # cwd policy), ask bridge (envelope wording, TUI component, HTTP ask
                           # flow, first-answer-wins hook wiring)
 npx tsc -p tsconfig.json  # strict type check
 ```

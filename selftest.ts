@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { SettingsManager } from "@earendil-works/pi-coding-agent";
-import { hashPassword, verifyPassword, issueToken, cookieHeader, clearCookieHeader, tokenFromCookie, sanitizeEntry, diffLeaf, inputOpts, startServer, default as piCockpit, type AnyRec, type ImageInput, LOGIN_PAGE, CHAT_PAGE, buildAskEnvelope, extractAskQuestions, AskTuiComponent, ASK_RESERVED_LABELS, type AskQuestion, type AskOutcome, parseBashLine, cleanBashText, missingBashMessages, mergeBashMessages, runWebBash, bashSettingsRef, BASHOUT_STREAM_LIMIT, BASH_TIMEOUT_MS } from "./index.ts";
+import { hashPassword, verifyPassword, issueToken, cookieHeader, clearCookieHeader, tokenFromCookie, sanitizeEntry, diffLeaf, inputOpts, startServer, default as piCockpit, type AnyRec, type ImageInput, LOGIN_PAGE, CHAT_PAGE, buildAskEnvelope, extractAskQuestions, AskTuiComponent, ASK_RESERVED_LABELS, type AskQuestion, type AskOutcome, parseBashLine, cleanBashText, missingBashMessages, mergeBashMessages, runWebBash, bashSettingsRef, BASHOUT_STREAM_LIMIT, BASH_TIMEOUT_MS, sessionCost } from "./index.ts";
 
 let failed = 0, passed = 0;
 function check(name: string, cond: boolean): void {
@@ -65,6 +65,37 @@ function check(name: string, cond: boolean): void {
   check("diffLeaf: null last leaf -> resync", diffLeaf(byId, null, "d").kind === "resync");
 }
 
+// ---------- session cost ----------
+{
+  const asst = (total: number | undefined): AnyRec => ({
+    type: "message", id: "a",
+    message: {
+      role: "assistant", content: [],
+      // usage lives INSIDE the message object (pi's format; getSessionStats
+      // reads message.usage for assistant messages).
+      ...(total !== undefined ? { usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total } } } : {}),
+    },
+  });
+  check("sessionCost: sums assistant usage.cost.total; user entries and missing usage contribute nothing",
+    sessionCost([
+      { type: "message", message: { role: "user", content: "hi" } },
+      asst(0.25),
+      asst(undefined),
+    ]) === 0.25);
+  check("sessionCost: includes toolResult, compaction, and branch_summary usage (terminal /session parity)",
+    sessionCost([
+      { type: "message", message: { role: "toolResult", usage: { cost: { total: 0.125 } } } },
+      { type: "compaction", summary: "s", usage: { cost: { total: 0.25 } } },
+      { type: "branch_summary", summary: "s", usage: { cost: { total: 0.5 } } },
+      asst(0.125),
+    ]) === 1);
+  check("sessionCost: empty, zero, negative, and malformed cost shapes are safe (0)",
+    sessionCost([]) === 0 &&
+    sessionCost([asst(0), asst(-1)]) === 0 &&
+    sessionCost([{ type: "message", message: { role: "assistant", usage: { cost: "weird" } } } as AnyRec]) === 0 &&
+    sessionCost([{ type: "message", message: { role: "toolResult" } }, { type: "compaction" }] as AnyRec[]) === 0);
+}
+
 // ---------- pages ----------
 {
   const scriptOf = (page: string): string[] => {
@@ -110,6 +141,14 @@ function check(name: string, cond: boolean): void {
     usageText({ tokens: null, contextWindow: 200000, percent: null }) === "—/200k" &&
     usageText(null) === "");
 
+  const fmtCostSrc = fnSrc("fmtCost");
+  const fmtCostFn = fmtCostSrc
+    ? (new Function(fmtCostSrc + "; return fmtCost;")() as (c: unknown) => string)
+    : null;
+  check("page: fmtCost — 2dp at cents, 3dp under a cent, 4dp under a mill, $ for dollars, empty for zero/null/junk",
+    !!fmtCostFn && fmtCostFn(0.08) === "$0.08" && fmtCostFn(0.001) === "$0.001" && fmtCostFn(0.0003) === "$0.0003" && fmtCostFn(12.345) === "$12.35" &&
+    fmtCostFn(0) === "" && fmtCostFn(null) === "" && fmtCostFn("1") === "");
+
   check("page: mobile CSS wraps meta and hides cwd",
     CHAT_PAGE.includes("@media (max-width:640px)") && CHAT_PAGE.includes("m-cwd"));
 
@@ -150,7 +189,7 @@ function check(name: string, cond: boolean): void {
   const fakeDoc = { title: "", createElement: () => fakeEl() };
   const runMeta = (cm: Record<string, unknown>, busy = false): FakeEl =>
     (new Function("document", "curMeta", "metaEl", "busy",
-      fmtSrc + "\n" + usageSrc + "\n" + metaSegSrc + "\n" + upMetaSrc +
+      fmtSrc + "\n" + usageSrc + "\n" + fmtCostSrc + "\n" + metaSegSrc + "\n" + upMetaSrc +
       "\nupdateMetaLine(); return metaEl;")(fakeDoc, cm, fakeEl(), busy) as FakeEl);
 
   const el1 = metaSegSrc && upMetaSrc ? runMeta({ sessionName: "s1", model: "p/m", cwd: "/w", usage: { tokens: 45321, contextWindow: 200000, percent: 22.66 } }) : null;
@@ -161,10 +200,17 @@ function check(name: string, cond: boolean): void {
   const el2 = metaSegSrc && upMetaSrc ? runMeta({ sessionName: null, model: "", cwd: "/w", usage: null }) : null;
   check("page: meta line omits usage segment when absent",
     !!el2 && el2.children.length === 3 && el2.children[0].textContent === "pi session");
+  const el3 = metaSegSrc && upMetaSrc ? runMeta({ sessionName: "s1", model: "p/m", cwd: "/w", usage: { tokens: 45321, contextWindow: 200000, percent: 22.66 }, cost: 1.234 }) : null;
+  check("page: meta line appends cost segment after usage when cost > 0",
+    !!el3 && el3.children.length === 5 &&
+    el3.children[4].className === "m m-cost" && el3.children[4].textContent === "$1.23");
+  check("page: meta line omits cost segment when absent or zero",
+    runMeta({ sessionName: "s1", model: "p/m", cwd: "/w", usage: null, cost: 0 }).children.length === 3 &&
+    runMeta({ sessionName: "s1", model: "p/m", cwd: "/w", usage: null, cost: 2.5 }).children.length === 4);
 
-  const titleFn = fmtSrc && usageSrc && metaSegSrc && upMetaSrc
+  const titleFn = fmtSrc && usageSrc && fmtCostSrc && metaSegSrc && upMetaSrc
     ? new Function("document", "curMeta", "metaEl", "busy",
-        fmtSrc + "\n" + usageSrc + "\n" + metaSegSrc + "\n" + upMetaSrc +
+        fmtSrc + "\n" + usageSrc + "\n" + fmtCostSrc + "\n" + metaSegSrc + "\n" + upMetaSrc +
         "\nupdateMetaLine(); return document.title;")
     : null;
   const titleBusy = titleFn
@@ -234,10 +280,13 @@ function check(name: string, cond: boolean): void {
     !!md && md("line one\nline two") === "<p>line one<br>line two</p>");
   check("md: unclosed fence still shows the code",
     !!md && md("```js\nconst a = 1;").includes("<pre>const a = 1;</pre>"));
-  check("page: assistant finalize renders markdown; streaming stays plain text",
-    CHAT_PAGE.includes("pendingEl.innerHTML = thinkHtml(think) + md(full)") &&
-    CHAT_PAGE.includes("addMsg('assistant', thinkHtml(think) + md(full), 'md')") &&
+  check("page: assistant finalize renders markdown with the LLM call's cost tag; streaming stays plain text",
+    CHAT_PAGE.includes("pendingEl.innerHTML = thinkHtml(think) + md(full) + costHtml") &&
+    CHAT_PAGE.includes("addMsg('assistant', thinkHtml(think) + md(full) + costHtml, 'md')") &&
     CHAT_PAGE.includes("pendingTxtEl.textContent = tx"));
+  check("page: finalized assistant bubbles tag usage.cost.total via fmtCost, zero cost untagged",
+    CHAT_PAGE.includes("m.usage.cost ? m.usage.cost.total : 0") &&
+    CHAT_PAGE.includes("costHtml = '<span class=\"m-cost\">' + fmtCost(ct) + '</span>'"));
   check("page: codebox copy button wired (clipboard + execCommand fallback)",
     CHAT_PAGE.includes("copybtn") && CHAT_PAGE.includes("execCommand('copy')"));
 }
@@ -790,6 +839,7 @@ async function wiringTests(): Promise<void> {
       usage,
       ask,
       navCalls,
+      entries,
       ctx: {
         ui,
         sessionManager: {
@@ -839,6 +889,7 @@ async function wiringTests(): Promise<void> {
   const c1 = makeCtx([
     { type: "message", id: "e1", parentId: null, timestamp: "1", message: { role: "user", content: "first" } },
     { type: "message", id: "e2", parentId: "e1", timestamp: "2", message: { role: "user", content: "second" } },
+    { type: "message", id: "e3", parentId: "e2", timestamp: "3", message: { role: "assistant", content: [{ type: "text", text: "reply" }], usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 110, cost: { input: 0.5, output: 0.25, cacheRead: 0, cacheWrite: 0, total: 0.75 } } } },
   ], "e1");
   fake1.emit("session_start", { type: "session_start", reason: "start" }, c1.ctx);
 
@@ -872,6 +923,8 @@ async function wiringTests(): Promise<void> {
   let c2: ReturnType<typeof makeCtx> | null = null;
   try {
     await waitUntil("event: snapshot", 3000);
+    check("wiring: snapshot meta includes session cost (sum of entry usage, terminal /session parity)",
+      client.get().includes('"cost":0.75'));
 
     const in1 = await fetch(base + "/input", { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify({ text: "before-new" }) });
     check("wiring: /input works on the first session",
@@ -879,10 +932,12 @@ async function wiringTests(): Promise<void> {
 
     c1.usage.tokens = 45000;
     c1.usage.percent = 22;
+    // A settled run persists its trailing assistant message: cost grows by its usage.
+    c1.entries.push({ type: "message", id: "e4", parentId: "e3", timestamp: "4", message: { role: "assistant", content: [{ type: "text", text: "more" }], usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 110, cost: { input: 0.25, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.25 } } } });
     fake1.emit("agent_settled", { type: "agent_settled" }, c1.ctx);
-    await waitUntil('"tokens":45000', 3000);
-    check("wiring: agent_settled broadcasts meta with fresh context usage",
-      client.get().includes("event: meta") && client.get().includes('"tokens":45000'));
+    await waitUntil('"cost":1', 3000);
+    check("wiring: agent_settled broadcasts meta with fresh usage and updated session cost",
+      client.get().includes("event: meta") && client.get().includes('"tokens":45000') && client.get().includes('"cost":1'));
 
     c1.usage.tokens = 46000;
     c1.usage.percent = 23;
