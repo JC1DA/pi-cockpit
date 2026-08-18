@@ -169,7 +169,7 @@ export function inputOpts(text: string, idle: boolean, mode: "steer" | "followUp
  * Injected into the web page: pi's prompt() executes registered commands
  * immediately and never records a user entry, so the page must not leave
  * their bubbles pending in userQ (they would never match and would stay
- * pinned at the bottom with later content rendered above them). The
+ * dashed forever). The
  * selftest asserts this list matches every pi.registerCommand call.
  */
 export const WEB_COMMANDS = ["new", "compact", "model", "tree", "webserve"];
@@ -949,9 +949,7 @@ function addMsg(role, html, cls) {
   return d;
 }
 function tail(el) {
-  // append at the true end, i.e. before any dashed queued-user bubbles
-  var q = userQ.length ? userQ[0].el : null;
-  if (q) msgs.insertBefore(el, q); else msgs.appendChild(el);
+  msgs.appendChild(el);
   autoScroll();
   return el;
 }
@@ -1052,22 +1050,11 @@ function renderEntry(en) {
       }
       if (hit) {
         userQ.splice(i, 1);
+        // pi 0.84.x persists the user entry only after the reply has started
+        // streaming, so this append lands late — but the bubble already holds
+        // its chronological spot (agent content appends below it), so only
+        // the pending style drops.
         hit.el.classList.remove('pendinguser');
-        // pi 0.84.x persists a message only after its message_end handlers
-        // ran, so this append can land while the reply is still streaming OR
-        // after it already finalized — tail() puts agent content before the
-        // still-pending bubble either way. Re-anchor the bubble right after
-        // its marker (the last element that existed when it was sent): every
-        // element after the marker belongs to this message's turn and stays
-        // below it. Keeps chat order: user, then its answer.
-        var bm = hit.marker;
-        if (bm && bm.parentNode === msgs) {
-          var ref = bm.nextElementSibling;
-          if (ref !== hit.el) {
-            if (ref) msgs.insertBefore(hit.el, ref); else msgs.appendChild(hit.el);
-            autoScroll();
-          }
-        }
       } else {
         addMsg('user', esc(t) + imgThumbs(imgParts));
       }
@@ -1554,14 +1541,14 @@ function sendText(t, mode) {
   if (CMD.indexOf(cmd) >= 0) {
     // registered commands execute immediately (even mid-stream) and record
     // no user entry: a pending bubble would never match — it would stay
-    // dashed and pinned at the bottom with all later content rendered above
-    // it. Finalize in place instead; the command's effects (notes) flow below.
+    // dashed forever. Finalize in place instead; the command's effects
+    // (notes) flow below it.
     addMsg('user', esc(t));
   } else {
     var el = addMsg('user', esc(t) + imgThumbs(imgs), 'pendinguser');
-    // marker: last chat element existing before this bubble; on the entry's
-    // append the bubble is re-anchored right after it (see renderEntry)
-    userQ.push({ el: el, text: t, images: imgs, marker: el.previousElementSibling });
+    // pending until the entry's append solidifies it; the bubble keeps its
+    // chronological spot — agent content appends below it (see renderEntry)
+    userQ.push({ el: el, text: t, images: imgs });
   }
   postInput(t, mode, imgs);
 }

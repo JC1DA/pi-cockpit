@@ -1293,13 +1293,6 @@ async function clientOrderingTest(): Promise<void> {
       if (c.parentNode) { const i = c.parentNode.children.indexOf(c); if (i >= 0) c.parentNode.children.splice(i, 1); }
       c.parentNode = el; el.children.push(c); return c;
     };
-    // sibling accessors the page's bubble re-anchoring reads
-    Object.defineProperty(el, "nextElementSibling", {
-      get: () => { const p = el.parentNode; if (!p) return null; const i = p.children.indexOf(el); return i >= 0 && i + 1 < p.children.length ? p.children[i + 1] : null; },
-    });
-    Object.defineProperty(el, "previousElementSibling", {
-      get: () => { const p = el.parentNode; if (!p) return null; const i = p.children.indexOf(el); return i > 0 ? p.children[i - 1] : null; },
-    });
     // real DOM: insertBefore on an existing child MOVES it
     el.insertBefore = (c: E, ref: E | null) => {
       if (c.parentNode) { const i = c.parentNode.children.indexOf(c); if (i >= 0) c.parentNode.children.splice(i, 1); }
@@ -1370,9 +1363,10 @@ async function clientOrderingTest(): Promise<void> {
   check("client: send() POSTs /input with the text", fetchCalls.some((f) => f.startsWith("/input") && f.includes("hello")));
 
   // wire order for an idle send under pi 0.84.x's persist-after-emit contract:
-  //   status(busy) -> reply `update`s (streaming bubble lands ABOVE the still-
-  //   pending user bubble) -> user entry `append` (one event LATE) -> status+
-  //   meta at agent_settled -> final assistant `append` (the settled flush)
+  //   status(busy) -> reply `update`s (streaming bubble appends BELOW the
+  //   still-pending user bubble) -> user entry `append` (one event LATE,
+  //   just solidifies the bubble) -> status+meta at agent_settled -> final
+  //   assistant `append` (the settled flush)
   fire("status", { busy: true });
   fire("update", { role: "assistant", content: [{ type: "text", text: "work" }] });
   fire("update", { role: "assistant", content: [{ type: "text", text: "working..." }] });
@@ -1418,9 +1412,9 @@ async function clientOrderingTest(): Promise<void> {
   check("client: no pending bubbles left after the thinking run",
     handles.pendingEl() === null);
 
-  // --- steer while streaming (the reported bug): the user entry's append can
-  // land only AFTER the reply already finalized above the still-pending
-  // bubble — the bubble must be re-anchored above its own answer ---
+  // --- steer while streaming: the user entry's append can land only AFTER
+  // the reply already finalized — the bubble must still end up above its
+  // own answer, without ever having moved ---
   fire("status", { busy: true });
   fire("update", { role: "assistant", content: [{ type: "text", text: "long in-flight answer" }] });
   idOf("input")!.value = "steer question";
@@ -1434,15 +1428,14 @@ async function clientOrderingTest(): Promise<void> {
   const iS1 = kids3.findIndex((k) => (k._text as string).includes("in-flight answer (truncated)"));
   const iU4 = kids3.findIndex((k) => k.className === "msg user" && (k._text as string).includes("steer question"));
   const iS2 = kids3.findIndex((k) => (k._text as string).includes("answer to steer (truncated)"));
-  check("client: steer bubble re-anchored between the old reply and its own answer",
+  check("client: steer bubble sits between the old reply and its own answer",
     iS1 >= 0 && iU4 === iS1 + 1 && iS2 === iU4 + 1);
   check("client: steer bubble loses the pending style",
     iU4 >= 0 && !kids3[iU4].className.includes("pendinguser"));
 
   // --- web ! bash: pi records no user entry for a bang line (only a
   // bashExecution entry), so no chat bubble either — the bash card is its
-  // representation (TUI parity). A stale bubble would stay pinned at the
-  // bottom with later content rendered above it. ---
+  // representation (TUI parity). A stale bubble would stay dashed forever. ---
   const nBefore = (handles.msgs().children as E[]).length;
   idOf("input")!.value = "! git status";
   handles.send();

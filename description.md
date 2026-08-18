@@ -56,11 +56,12 @@ and folds into a collapsed block above the answer.
   pi 0.84.x persists each message only after its `message_end` handlers ran,
   so the web client sees the reply start streaming before the user entry is
   persisted — and for a steer the entry can even land after the reply has
-  already finalized (the common case with a long first reply). The view
-  records a marker (the last chat element present when the bubble was sent)
-  and re-anchors the optimistic user bubble right after it when the entry
-  arrives, so the bubble sits above its own answer either way, and the
-  run's trailing entry is flushed at `agent_settled`, so the final answer
+  already finalized (the common case with a long first reply). The
+  optimistic user bubble keeps its chronological position either way: it
+  stays dashed where it was sent, all agent content (streaming text, tool
+  and bash cards) appends below it, and when the late entry arrives the
+  bubble simply solidifies above its own answer — no reordering. The run's
+  trailing entry is flushed at `agent_settled`, so the final answer
   finalizes as markdown immediately instead of waiting for the next
   interaction.
 - **Image upload** — the **📎** button in the footer (or paste, or drag & drop
@@ -87,7 +88,7 @@ and folds into a collapsed block above the answer.
   matching the terminal. The bang line itself never becomes a chat bubble —
   pi records no user entry for it (only the `bashExecution` entry), so the
   live bash card is its only representation (TUI parity); a bubble would have
-  no entry to anchor to and would have stuck pinned at the bottom. One bash
+  no entry to solidify it and would have stayed dashed forever. One bash
   command at a time: a second one while a
   command runs is rejected with a note (the terminal has the same rule). The
   web has no Esc, so a hung command is killed after 10 minutes and recorded
@@ -105,7 +106,7 @@ and folds into a collapsed block above the answer.
   (the current leaf marked; picking one is the same as typing the command).
   Commands execute immediately, even while the agent is busy. In the web view
   each command shows as a solid user bubble in place (pi records no user entry
-  for registered commands, so there is nothing to re-anchor) with its results
+  for registered commands, so there is nothing to solidify) with its results
   as notes directly below it.
   Other `/`-prefixed input follows terminal semantics (skills, prompt
   templates; unknown text goes to the model as literal text).
