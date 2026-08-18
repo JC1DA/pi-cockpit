@@ -523,6 +523,12 @@ details.tool{align-self:flex-start;max-width:85%;background:var(--tool);border:1
 details.tool.err{border-color:#b91c1c}
 details.tool summary{cursor:pointer;color:var(--dim);font-size:12px}
 details.tool pre{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;color:#c8c8c8}
+#toolbar{display:flex;gap:10px;align-items:center;padding:4px 12px;background:var(--panel);border-bottom:1px solid #333;font-size:12px;color:var(--dim)}
+#toolbar label{display:flex;gap:6px;align-items:center}
+#toolbar select{background:#111;color:var(--text);border:1px solid #444;border-radius:4px;padding:1px 4px;font:inherit;font-size:12px}
+#toolbar button{background:#374151;color:var(--text);border:0;border-radius:4px;padding:2px 8px;cursor:pointer;font:inherit;font-size:12px}
+body.ft-none .tool{display:none}
+body.ft-errors .tool:not(.err){display:none}
 .note{align-self:center;color:var(--dim);font-size:12px;white-space:pre-wrap}
 footer{display:flex;flex-direction:column;gap:8px;padding:10px 12px;background:var(--panel);border-top:1px solid #333}
 #attrow{display:flex;gap:8px}
@@ -562,6 +568,14 @@ footer button{background:var(--user);color:#fff;border:0;border-radius:8px;paddi
 <button id="stop">Stop</button>
 <button id="logout">Logout</button>
 </header>
+<div id="toolbar">
+<label>tools <select id="toolfilter">
+<option value="all">All</option>
+<option value="errors">Errors only</option>
+<option value="none">Hidden</option>
+</select></label>
+<button id="colall" title="Collapse or expand every tool card">Collapse all</button>
+</div>
 <div id="msgs"></div>
 <footer>
 <div id="attstrip"></div>
@@ -1347,6 +1361,30 @@ if (typeof Notification === 'undefined' || Notification.permission === 'denied')
     try { r = Notification.requestPermission(function (p) { if (!r || typeof r.then !== 'function') done(p); }); }
     catch (e) { r = null; }
     if (r && typeof r.then === 'function') r.then(done);
+  });
+}
+// --- tool output: visibility filter (all / errors / hidden) + collapse-all toggle ---
+var toolFilterSel = document.getElementById('toolfilter'),
+    colAllBtn = document.getElementById('colall');
+function applyToolFilter(v) {
+  v = (v === 'errors' || v === 'none') ? v : 'all';
+  ['ft-all', 'ft-errors', 'ft-none'].forEach(function (c) {
+    document.body.classList.toggle(c, c === 'ft-' + v);
+  });
+  storeSet('piCockpitToolFilter', v);
+}
+if (toolFilterSel) {
+  var savedFilter = storeGet('piCockpitToolFilter');
+  if (savedFilter === 'all' || savedFilter === 'errors' || savedFilter === 'none') toolFilterSel.value = savedFilter;
+  toolFilterSel.addEventListener('change', function () { applyToolFilter(toolFilterSel.value); });
+  applyToolFilter(toolFilterSel.value);
+}
+if (colAllBtn) {
+  colAllBtn.addEventListener('click', function () {
+    var collapse = colAllBtn.textContent === 'Collapse all';
+    var ds = document.querySelectorAll('.tool');
+    for (var i = 0; i < ds.length; i++) ds[i].open = !collapse;
+    colAllBtn.textContent = collapse ? 'Expand all' : 'Collapse all';
   });
 }
 </script>

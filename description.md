@@ -101,6 +101,13 @@ above the answer.
   `/context`). It updates after each agent run and on model change, and reads
   `—` right after `/compact` until the next assistant response. On narrow
   screens (≤640px) the working-directory segment is hidden and the rest wraps.
+- **Tool-output toolbar** — a thin bar above the messages has a filter
+  dropdown (`All` / `Errors only` / `Hidden`) and a `Collapse all` toggle. The
+  filter is a single body class that CSS uses to gate every tool card (current
+  and future) — `Hidden` leaves only user/assistant text, `Errors only` shows
+  only errored calls — and the choice is remembered per-browser in
+  localStorage. `Collapse all` / `Expand all` opens or closes every tool card
+  at once; individual cards stay click-to-expand regardless of the filter.
 - The server stops when pi quits or on `/reload`. It survives session
   replacement (`/new`, `/fork`, same-directory `/resume`) and resyncs every web
   client to the new session. A cross-directory `/resume` makes pi re-import the

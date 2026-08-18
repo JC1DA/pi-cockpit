@@ -33,7 +33,9 @@ in a browser, enter the password, and the session streams live:
 - Assistant text streams token by token and renders as markdown when it
   finalizes: headings, lists, quotes, bold/code/links, and fenced code blocks
   with a copy button (links open in a new tab; only http/https/mailto URLs
-  become links); tool calls render as cards with their input and output.
+  become links); tool calls render as cards with their input and output. A
+  toolbar above the messages filters the tool cards (All / Errors only /
+  Hidden) and can collapse or expand them all at once.
 - **Thinking** — with reasoning models, the model's thinking streams dimmed
   in the live bubble and folds into a collapsed 💭 block above the finalized
   answer (click to expand).

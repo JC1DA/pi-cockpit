@@ -1063,7 +1063,7 @@ async function clientOrderingTest(): Promise<void> {
     createElement: () => mkEl(),
     addEventListener: () => {},
   };
-  for (const i of ["msgs", "input", "dot", "meta", "stop", "send", "logout", "notif", "attach", "attachfile", "attstrip"]) {
+  for (const i of ["msgs", "input", "dot", "meta", "stop", "send", "logout", "notif", "attach", "attachfile", "attstrip", "toolfilter", "colall"]) {
     const e = mkEl(); e.id = i;
   }
   class FEvSource {
@@ -1148,6 +1148,17 @@ async function clientOrderingTest(): Promise<void> {
     idxA2 >= 0 && (kids2[idxA2]._text as string).startsWith('<details class="thinkbox">') && (kids2[idxA2]._text as string).includes("full reasoning here"));
   check("client: no pending bubbles left after the thinking run",
     handles.pendingEl() === null);
+
+  // --- tool output filter: default all; a change flips the body class the CSS keys on ---
+  check("client: tool filter defaults to all", doc.body.className.indexOf("ft-all") >= 0);
+  idOf("toolfilter")!.value = "none";
+  idOf("toolfilter")!.listeners.change();
+  check("client: tool filter 'none' sets body ft-only (hides every tool card)",
+    doc.body.className.indexOf("ft-none") >= 0 && doc.body.className.indexOf("ft-all") < 0 && doc.body.className.indexOf("ft-errors") < 0);
+  idOf("toolfilter")!.value = "errors";
+  idOf("toolfilter")!.listeners.change();
+  check("client: tool filter 'errors' sets body ft-errors only",
+    doc.body.className.indexOf("ft-errors") >= 0 && doc.body.className.indexOf("ft-none") < 0 && doc.body.className.indexOf("ft-all") < 0);
 }
 
 await clientOrderingTest();
