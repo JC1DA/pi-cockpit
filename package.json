@@ -1,12 +1,39 @@
 {
   "name": "remote-pi-ext",
-  "private": true,
+  "version": "0.1.0",
+  "description": "Browse and drive the current pi session from a web browser: live SSE streaming, messages, steering, web ! bash, image attach, and ask-user-question bridge.",
   "type": "module",
-  "pi": { "extensions": ["./index.ts"] },
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "tui",
+    "web",
+    "sse",
+    "remote"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JC1DA/pi-cockpit.git"
+  },
+  "files": [
+    "index.ts",
+    "description.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
   "devDependencies": {
-    "typescript": "^5.5.0",
-    "@types/node": "^22.0.0",
     "@earendil-works/pi-coding-agent": "^0.84.2",
-    "@earendil-works/pi-tui": "^0.84.2"
+    "@earendil-works/pi-tui": "^0.84.2",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
   }
 }

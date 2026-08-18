@@ -8,16 +8,23 @@ execution and shell settings).
 
 ## Install
 
-Point pi at this directory (a symlink keeps it in sync with this checkout):
+```bash
+pi install npm:remote-pi-ext                # from npm
+pi install git:github.com/JC1DA/pi-cockpit  # or straight from git
+```
+
+Then run `/reload` in a pi session (restart pi if `/webserve` is not listed).
+
+To develop against a checkout, point pi at the directory instead (a symlink
+keeps it in sync with the checkout):
 
 ```bash
 mkdir -p ~/.pi/agent/extensions
 ln -s /path/to/this/directory ~/.pi/agent/extensions/pi-cockpit
 ```
 
-Or copy the directory there instead. Then run `/reload` in a pi session
-(restart pi if `/webserve` is not listed). There is no build step:
-`node_modules` only exists for type checking, pi never loads it.
+There is no build step: `node_modules` only exists for type checking, pi never
+loads it.
 
 ## Use
 

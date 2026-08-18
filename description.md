@@ -21,9 +21,10 @@ and folds into a collapsed block above the answer.
 - `/webserve status` — shows running/stopped and the actual port.
 
 ## Install / use
-1. Put this directory at `~/.pi/agent/extensions/<this directory>/`
-   (auto-discovered) or list it in `settings.json` under `extensions`.
-   (Or install from GitHub: `pi install git:github.com/JC1DA/pi-cockpit`.)
+1. `pi install npm:remote-pi-ext` (or from GitHub:
+   `pi install git:github.com/JC1DA/pi-cockpit`), or put this directory at
+   `~/.pi/agent/extensions/<this directory>/` (auto-discovered) or list it in
+   `settings.json` under `extensions`.
 2. In a pi session: `/webserve start`, type the password, open the printed URL,
    unlock in the browser.
 
