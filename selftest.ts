@@ -622,7 +622,7 @@ async function askServerTests(): Promise<void> {
 
   const login = await fetch(base + "/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: "testpw123" }) });
   const cookie = (login.headers.get("set-cookie") ?? "").split(";")[0];
-  const client = await new Promise<{ get: () => string; close: () => void }>((resolve, reject) => {
+  const connect = (): Promise<{ get: () => string; close: () => void }> => new Promise((resolve, reject) => {
     const chunks: string[] = [];
     const req = http.get(base + "/events", { headers: { cookie } }, (res) => {
       res.on("data", (c: Buffer) => chunks.push(c.toString()));
@@ -630,10 +630,11 @@ async function askServerTests(): Promise<void> {
     });
     req.on("error", reject);
   });
-  const waitUntil = (needle: string, ms = 3000): Promise<void> => new Promise((resolve, reject) => {
+  const client = await connect();
+  const waitUntil = (needle: string, src: { get: () => string }, ms = 3000): Promise<void> => new Promise((resolve, reject) => {
     const t0 = Date.now();
     const t = setInterval(() => {
-      if (client.get().includes(needle)) { clearInterval(t); resolve(); }
+      if (src.get().includes(needle)) { clearInterval(t); resolve(); }
       else if (Date.now() - t0 > ms) { clearInterval(t); reject(new Error("timeout: " + needle)); }
     }, 20);
   });
@@ -641,7 +642,7 @@ async function askServerTests(): Promise<void> {
   try {
     check("ask server: clientCount 1 with a connected client", ws.clientCount() === 1);
     const p = ws.askUser("a1", qs);
-    await waitUntil("event: ask");
+    await waitUntil("event: ask", client);
     check("ask server: ask broadcast reaches the client with id + questions",
       client.get().includes('"id":"a1"') && client.get().includes('"question":"Q?"'));
     const r = await fetch(base + "/ask-answer", { method: "POST", headers: { "Content-Type": "application/json", cookie },
@@ -650,7 +651,7 @@ async function askServerTests(): Promise<void> {
     const outcome = await p;
     check("ask server: askUser resolves with the posted answer",
       !!outcome && !outcome.cancelled && outcome.answers.length === 1 && outcome.answers[0].answer === "B");
-    await waitUntil("ask-resolved");
+    await waitUntil("ask-resolved", client);
     check("ask server: ask-resolved broadcast closes client modals", client.get().includes('"id":"a1"'));
     const dup = await fetch(base + "/ask-answer", { method: "POST", headers: { "Content-Type": "application/json", cookie },
       body: JSON.stringify({ id: "a1", cancelled: false, answers: [{ index: 0, kind: "option", answer: "B" }] }) });
@@ -658,9 +659,49 @@ async function askServerTests(): Promise<void> {
     const bad = await fetch(base + "/ask-answer", { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: "{nope" });
     check("ask server: bad json /ask-answer -> 400", bad.status === 400);
 
+    // The mobile bug flow: the only client leaves while a question is pending
+    // (tab killed / connection dropped) — the ask must survive — then a new
+    // client reconnects, is replayed the question, and its answer lands.
     const p2 = ws.askUser("a2", qs);
+    await waitUntil("event: ask", client);
     client.close();
-    check("ask server: last client leaving resolves pending ask with null", (await p2) === null);
+    await new Promise((r) => setTimeout(r, 100)); // let the close propagate
+    const stillPending = await Promise.race([
+      p2.then((o) => (o === null ? "null" : "answered")),
+      new Promise<string>((r) => setTimeout(() => r("pending"), 150)),
+    ]);
+    check("ask server: last client leaving leaves the ask pending",
+      stillPending === "pending" && ws.clientCount() === 0);
+    const client2 = await connect();
+    try {
+      await waitUntil('"id":"a2"', client2);
+      check("ask server: reconnecting client is replayed the pending ask",
+        client2.get().includes("event: ask") && client2.get().includes('"id":"a2"') && client2.get().includes('"question":"Q?"'));
+      const r2 = await fetch(base + "/ask-answer", { method: "POST", headers: { "Content-Type": "application/json", cookie },
+        body: JSON.stringify({ id: "a2", cancelled: false, answers: [{ index: 0, kind: "option", answer: "A" }] }) });
+      check("ask server: /ask-answer from a reconnected client -> 200", r2.status === 200);
+      const o2 = await p2;
+      check("ask server: askUser resolves with the reconnected client's answer",
+        !!o2 && !o2.cancelled && o2.answers.length === 1 && o2.answers[0].answer === "A");
+    } finally {
+      client2.close();
+    }
+
+    // Pre-aborted signal: settled up front — the connected client must NOT
+    // get a zombie modal that 409s on every answer attempt, and the promise
+    // must not hang waiting for an abort event that can never fire again.
+    const client3 = await connect();
+    try {
+      const ac = new AbortController();
+      ac.abort();
+      const p3 = ws.askUser("a3", qs, ac.signal);
+      const o3 = await p3;
+      await new Promise((r) => setTimeout(r, 100)); // give a bogus broadcast a chance to arrive
+      check("ask server: pre-aborted signal resolves null without broadcasting ask (no zombie modal)",
+        o3 === null && !client3.get().includes("event: ask"));
+    } finally {
+      client3.close();
+    }
   } finally {
     client.close();
     ws.stop();
@@ -1112,7 +1153,7 @@ async function wiringTests(): Promise<void> {
 
       const login3 = await fetch(base3 + "/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: "testpw123" }) });
       const cookie3 = (login3.headers.get("set-cookie") ?? "").split(";")[0];
-      const sse3 = await new Promise<{ get: () => string; close: () => void }>((resolve, reject) => {
+      const connectSse3 = (): Promise<{ get: () => string; close: () => void }> => new Promise((resolve, reject) => {
         const chunks: string[] = [];
         const req = http.get(base3 + "/events", { headers: { cookie: cookie3 } }, (res) => {
           res.on("data", (c: Buffer) => chunks.push(c.toString()));
@@ -1120,10 +1161,11 @@ async function wiringTests(): Promise<void> {
         });
         req.on("error", reject);
       });
-      const waitIn3 = (needle: string, ms = 3000): Promise<void> => new Promise((resolve, reject) => {
+      const sse3 = await connectSse3();
+      const waitIn3 = (needle: string, src: { get: () => string } = sse3, ms = 3000): Promise<void> => new Promise((resolve, reject) => {
         const t0 = Date.now();
         const t = setInterval(() => {
-          if (sse3.get().includes(needle)) { clearInterval(t); resolve(); }
+          if (src.get().includes(needle)) { clearInterval(t); resolve(); }
           else if (Date.now() - t0 > ms) { clearInterval(t); reject(new Error("timeout waiting for: " + needle)); }
         }, 20);
       });
@@ -1183,6 +1225,29 @@ async function wiringTests(): Promise<void> {
       check("wiring: client left -> terminal answer still resolves the call",
         r5?.block === true && r5.reason === envelope("B"));
       sse3.close();
+
+      // (f) the mobile bug: the client leaves mid-question (tab killed),
+      // reconnects, is replayed the pending question, and its web answer
+      // beats the still-open terminal overlay.
+      const sseF = await connectSse3(); // fresh client so the hook intercepts this call
+      c3.ask.tuiTypes = false; // no terminal timer: the web side is the expected resolution here
+      const p6 = toolCallHandler(askEvent("tc-f"), c3.ctx) as Promise<{ block?: boolean; reason?: string } | undefined>;
+      await waitIn3('"id":"tc-f"', sseF);
+      sseF.close();
+      await new Promise((r) => setTimeout(r, 100)); // let the close propagate
+      const sseG = await connectSse3(); // the mobile user comes back
+      await waitIn3('"id":"tc-f"', sseG);
+      check("wiring: reconnecting client is replayed the pending question",
+        sseG.get().includes("event: ask") && sseG.get().includes('"id":"tc-f"'));
+      const ansF = await fetch(base3 + "/ask-answer", { method: "POST", headers: { "Content-Type": "application/json", cookie: cookie3 },
+        body: JSON.stringify({ id: "tc-f", cancelled: false, answers: [{ index: 0, kind: "option", answer: "B" }] }) });
+      check("wiring: /ask-answer from the reconnected client -> 200", ansF.status === 200);
+      const r6 = await p6;
+      check("wiring: reconnected web answer wins -> block with that envelope",
+        r6?.block === true && r6.reason === envelope("B"));
+      check("wiring: terminal overlay closed when the reconnected web side wins",
+        c3.ask.doneCalls[c3.ask.doneCalls.length - 1] === null);
+      sseG.close();
     }
   } finally {
     if (fake3 && c3) { try { await fake3.commands.get("webserve")!.handler("stop", c3.ctx); } catch { /* ok */ } }

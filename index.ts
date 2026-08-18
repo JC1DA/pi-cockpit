@@ -1707,11 +1707,13 @@ export interface WebServer {
   clientCount(): number;
   /**
    * Ask for answers over SSE: broadcasts `ask {id, questions}` and resolves
-   * when `POST /ask-answer` matches `id` — or null when the server stops,
-   * all clients leave, or `signal` aborts first (whichever the caller should
-   * fall back from). First answer wins; later posts for the same id get 409.
-   */
-  askUser(id: string, questions: AskQuestion[], signal?: AbortSignal): Promise<AskOutcome | null>;
+   * when `POST /ask-answer` matches `id` — or null when the server stops or
+   * `signal` aborts first (whichever the caller should fall back from).
+   * Client departures do NOT settle the ask: it stays pending and is replayed
+   * to any client that (re)connects, so a mobile tab that dies and comes back
+   * still gets the modal and its answer still lands. First answer wins; later
+   * posts for the same id get 409.
+   */  askUser(id: string, questions: AskQuestion[], signal?: AbortSignal): Promise<AskOutcome | null>;
   /** Resolve a pending askUser outside the HTTP path (closes the web modal). */
   settleAsk(id: string, outcome: AskOutcome | null): boolean;
 }
@@ -1799,7 +1801,10 @@ export function startServer(opts: {
 }): Promise<WebServer> {
   const { passwordHash, tokens, api } = opts;
   const clients = new Set<SseClient>();
-  const askWaiters = new Map<string, (o: AskOutcome | null) => void>();
+  // Questions are kept with the waiter so a (re)connecting client can be
+  // replayed the pending ask (openSse) — the one-shot `ask` broadcast at ask
+  // time is not enough: mobile tabs die and come back.
+  const askWaiters = new Map<string, { questions: AskQuestion[]; finish: (o: AskOutcome | null) => void }>();
   let closed = false;
   const server = http.createServer((req, res) => { void handle(req, res); });
 
@@ -1808,7 +1813,7 @@ export function startServer(opts: {
     if (!w) return false;
     askWaiters.delete(id);
     broadcast("ask-resolved", { id, outcome });
-    w(outcome);
+    w.finish(outcome);
     return true;
   }
 
@@ -1819,14 +1824,13 @@ export function startServer(opts: {
     }
   }
 
-  // Last client left while a question was pending: nobody on the web can
-  // answer anymore — wake the waiter (null) so the terminal side can finish alone.
-  function checkAskOnLeave(): void {
-    if (clients.size === 0) for (const id of [...askWaiters.keys()]) settleAsk(id, null);
-  }
-
   function askUser(id: string, questions: AskQuestion[], signal?: AbortSignal): Promise<AskOutcome | null> {
     if (closed || clients.size === 0) return Promise.resolve(null);
+    // An ALREADY-aborted signal can never fire an "abort" listener (the event
+    // was dispatched before we could listen), so the waiter would hang for
+    // the rest of the server's life — and the broadcast would open a zombie
+    // modal nobody can answer (every POST would 409). Settle up front instead.
+    if (signal && signal.aborted) return Promise.resolve(null);
     let onAbort: (() => void) | undefined;
     const p = new Promise<AskOutcome | null>((resolve) => {
       const finish = (o: AskOutcome | null) => {
@@ -1834,8 +1838,8 @@ export function startServer(opts: {
         resolve(o);
       };
       const prev = askWaiters.get(id);
-      if (prev) prev(null); // duplicate hook invocation: settle the stale waiter so the old await can't hang
-      askWaiters.set(id, finish);
+      if (prev) prev.finish(null); // duplicate hook invocation: settle the stale waiter so the old await can't hang
+      askWaiters.set(id, { questions, finish });
       onAbort = () => { settleAsk(id, null); };
       if (signal) signal.addEventListener("abort", onAbort, { once: true });
     });
@@ -1852,13 +1856,16 @@ export function startServer(opts: {
     safeWrite(res, "retry: 2000\n\n");
     const snap = api.getSnapshot();
     writeSse(res, "snapshot", { entries: snap.entries, meta: snap.meta });
+    // (Re)connecting client: replay every pending question (written before the
+    // client joins `clients`, so no double-send via a concurrent broadcast).
+    for (const [id, a] of askWaiters) writeSse(res, "ask", { id, questions: a.questions });
     const client: SseClient = {
       res,
       hb: setInterval(() => { if (!safeWrite(res, ": hb\n\n")) res.end(); }, KEEPALIVE_MS),
       lastLeaf: snap.meta.leafId,
     };
     clients.add(client);
-    res.on("close", () => { clearInterval(client.hb); clients.delete(client); checkAskOnLeave(); });
+    res.on("close", () => { clearInterval(client.hb); clients.delete(client); });
   }
 
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -1967,6 +1974,9 @@ export function startServer(opts: {
     broadcast: (name, data) => broadcast(name, data),
     resyncAll() {
       if (closed) return;
+      // Session replaced: its pending questions are gone. The ask-resolved
+      // broadcast below closes any stale modal on still-connected clients.
+      for (const id of [...askWaiters.keys()]) settleAsk(id, null);
       for (const c of [...clients]) {
         let snap: { entries: AnyRec[]; meta: SnapshotMeta };
         try { snap = api.getSnapshot(); }
@@ -2304,7 +2314,13 @@ export default function (pi: ExtensionAPI): void {
   // before the tool executes; a returned {block} becomes the tool result the
   // model sees — we use the tool's own result wording so behavior is
   // indistinguishable). No web client -> return undefined -> the tool's own
-  // rich TUI flow runs exactly as before.
+  // rich TUI flow runs exactly as before. A web client that LEAVES mid-question
+  // does not kill the web side: the ask stays pending and is replayed when a
+  // client (re)connects, so a mobile tab that dies and comes back still gets
+  // the modal. (ponytail: with no terminal side — headless — a client that
+  // leaves and never returns leaves the agent waiting for Stop/abort instead
+  // of falling through to the tool's own flow, which cannot render headless
+  // either; acceptable for that corner case.)
   pi.on("tool_call", async (event, ctx) => {
     if (event.toolName !== "ask_user_question") return;
     const questions = extractAskQuestions((event.input as AnyRec).questions);
@@ -2337,9 +2353,10 @@ export default function (pi: ExtensionAPI): void {
     }
     const sides = termSide ? [webSide, termSide] : [webSide];
 
-    // First real answer wins; a null side means that surface died (all clients
-    // left / server stopped / host can't render / closed by the other side),
-    // so keep waiting for the rest. All dead -> undefined -> the tool's own flow.
+    // First real answer wins; a null side means that surface died (server
+    // stopped / signal aborted / host can't render / closed by the other side),
+    // so keep waiting for the rest. All dead -> undefined -> the tool's own
+    // flow. (Clients leaving is NOT a null side anymore — see above.)
     const outcome = await new Promise<AskOutcome | null>((resolve) => {
       let pending = sides.length;
       let done = false;

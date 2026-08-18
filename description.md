@@ -125,8 +125,13 @@ and folds into a collapsed block above the answer.
   terminal overlay; whichever answer lands first wins, the other surface
   closes, and the agent continues with the answer in the tool's standard
   result wording. With no web client connected, the tool's own terminal flow
-  runs unchanged. Note: pi marks blocked calls as error results internally;
-  the web view renders answered/declined questionnaires without error styling.
+  runs unchanged. A web client that drops mid-question (e.g. a mobile tab
+  being killed) does NOT cancel it: the question stays pending (still
+  answerable from the terminal overlay), and any client that (re)connects is
+  replayed the pending question — the modal comes back on reconnect and a
+  phone answer still wins. Note: pi marks blocked calls as error results
+  internally; the web view renders answered/declined questionnaires without
+  error styling.
 - The header also shows live context usage as `45k/200k (23%)` — current context
   tokens / the model's context window / percent (same source as the terminal's
   `/context`). It updates after each agent run and on model change, and reads
@@ -148,7 +153,7 @@ and folds into a collapsed block above the answer.
 
 ## Tests
 - `npm install` (dev-only type deps), then:
-  - `node selftest.ts` — 207 unit + HTTP-protocol checks (password,
+  - `node selftest.ts` — 223 unit + HTTP-protocol checks (password,
     tokens/cookie, sanitizer, leaf diff, page syntax + usage/meta formatting,
     tab-title ⏳ prefix, finish-notification decision matrix, image upload:
     /input size caps + MIME/count validation, page attach UI, thinking stream
@@ -157,9 +162,12 @@ and folds into a collapsed block above the answer.
     session recording, agent-context injection, one-at-a-time, full server
     against a fake pi api, ask bridge: envelope wording, TUI component,
     HTTP ask flow, tool_call hook wiring — first-answer-wins, decline,
-    duplicate 409, client-left fallback, agent_settled trailing-entry flush,
-    web-client ordering under the pi persist-after-emit contract, run by
-    driving the real page script in a DOM stub).
+    duplicate 409, pending ask survives client departure + replay to a
+    reconnecting client (server level and through the hook), no zombie modal
+    on a pre-aborted signal,
+    agent_settled trailing-entry flush, web-client ordering under the pi
+    persist-after-emit contract, run by driving the real page script in a
+    DOM stub).
   - `npx tsc -p tsconfig.json` — strict type check.
 - Manual e2e checklist: `pi -e ./index.ts` → `/webserve start` → login in a
   browser → watch live streaming → send a message from the web (appears in the
