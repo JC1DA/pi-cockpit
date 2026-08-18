@@ -30,17 +30,32 @@ Or copy the directory there instead. Then run `/reload` in a pi session
 `start` asks for a password (4+ characters) and prints the URL(s). Open one
 in a browser, enter the password, and the session streams live:
 
-- Assistant text appears token by token; tool calls render as cards with
-  their input and output.
+- Assistant text streams token by token and renders as markdown when it
+  finalizes: headings, lists, quotes, bold/code/links, and fenced code blocks
+  with a copy button (links open in a new tab; only http/https/mailto URLs
+  become links); tool calls render as cards with their input and output.
 - The message box sends real pi user messages. While the agent is busy,
-  Send steers the running agent (like Enter in the terminal) and the Queue
-  button (or alt+enter) waits until it finishes; while idle they start a run.
+  Send steers the running agent (like Enter in the terminal); while idle it
+  starts a run. Messages always end up in chronological order above their
+  answers, even though pi persists them a beat after the reply starts
+  streaming, and the final answer renders as markdown the moment the run
+  settles.
+- **Attach images** — the 📎 button, paste, or drag & drop onto the input
+  (png, jpeg, webp, gif; up to 3 per message, 4 MB each). Images ride with
+  the next message for vision-capable models and show as thumbnails in the
+  chat.
 - The message box also accepts commands: `/new` starts a new session,
   `/compact [instructions]` compacts the context, and `/model
   [provider/model-id]` switches the model (bare `/model` lists the available
   ones) — all run immediately, even while busy, and results appear as notes in
   the view.
 - **Stop** in the header interrupts the run, exactly like Esc.
+- **Finish notifications** — the 🔔 header button asks for notification
+  permission; while the tab is hidden, each finished run pings you with the
+  session name and a snippet of the last message. The tab title shows ⏳
+  while a run is in progress (works everywhere, no permission needed); on
+  plain-HTTP LAN pages the 🔔 button hides itself (browsers require a secure
+  context for notifications) and only the ⏳ indicator remains.
 - **Answer the agent's questions** — when the agent calls
   `ask_user_question` (rpiv-ask-user-question) and a browser is open, the
   questions appear in a web modal AND in the terminal; whichever answer lands
@@ -69,8 +84,9 @@ gets its own server (8765, 8766, ...).
 
 ```bash
 npm install               # dev-only type deps
-node selftest.ts          # 109 checks: password, tokens, sanitizer, leaf diff,
-                          # input dispatch, page JS (incl. usage/meta formatting), HTTP protocol,
+node selftest.ts          # 156 checks: password, tokens, sanitizer, leaf diff,
+                          # input dispatch, page JS (incl. usage/meta formatting, tab-title
+                          # prefix, finish notifications, markdown rendering), HTTP protocol,
                           # live SSE, pi wiring (factory re-run across session replacement,
                           # usage refresh, /resume cwd policy), ask bridge (envelope wording,
                           # TUI component, HTTP ask flow, first-answer-wins hook wiring)

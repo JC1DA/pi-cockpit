@@ -7,6 +7,8 @@ Starts a password-protected web server that streams the current pi session
 (user/assistant messages, tool calls, tool results, model changes, compaction
 markers) to a browser via Server-Sent Events, so you can watch the agent work
 from another machine on your LAN and type messages back into the agent.
+Assistant text renders as markdown (headings, lists, quotes, code, links,
+fenced code blocks with a copy button); user messages stay literal.
 
 ## Commands
 - `/webserve start [port]` — asks for a password (min 4 chars), starts the server
@@ -33,10 +35,32 @@ from another machine on your LAN and type messages back into the agent.
   password accordingly. No login rate limiting (LAN assumption).
 
 ## Behavior
+- The web view renders assistant text as markdown. While a message is
+  streaming it shows as plain text and switches to rendered markdown when it
+  finalizes; code blocks get a copy button (clipboard API, with an
+  execCommand fallback for plain-HTTP contexts), and links open in a new
+  tab (only http/https/mailto URLs become links).
 - Messages sent from the web appear in the terminal exactly as if typed there.
   While the agent is busy, Send steers the running agent (terminal Enter
-  parity); the Queue button or alt+enter queues a follow-up until it finishes.
-  Commands keep the command path in both cases.
+  parity); while idle it starts a run. The web has no queue path — the
+  terminal's alt+enter follow-up stays terminal-only. Commands keep the
+  command path in both cases.
+  pi 0.84.x persists each message only after its `message_end` handlers ran,
+  so the web client sees the reply start streaming before the user entry is
+  persisted; the view re-positions the optimistic user bubble to its
+  chronological spot (above its answer) when the entry arrives, and the
+  run's trailing entry is flushed at `agent_settled`, so the final answer
+  finalizes as markdown immediately instead of waiting for the next
+  interaction.
+- **Image upload** — the **📎** button in the footer (or paste, or drag & drop
+  onto the input) attaches up to 3 images (png/jpeg/webp/gif, 4 MB each) to
+  the next message; they travel as base64 image-content parts through the
+  same steer path and render as thumbnails in the chat (images pasted into
+  the terminal render in the web view too). The selected model must be
+  vision-capable for the model to see them. Images persist in the session
+  file as base64 and count against the context until compaction. `/input` is
+  the only route with a body cap above the spec's 100 KB (12 MB, to carry
+  the images); other routes keep the 100 KB limit.
 - The web input box also accepts commands: `/new` starts a new session,
   `/compact [instructions]` compacts the context, `/model [provider/model-id]`
   switches the model, and `/tree [entry-id]` jumps to a previous point in the
@@ -48,6 +72,16 @@ from another machine on your LAN and type messages back into the agent.
   Other `/`-prefixed input follows terminal semantics (skills, prompt
   templates; unknown text goes to the model as literal text).
 - The **Stop** button in the web header behaves like Esc in the terminal.
+- **Finish notifications** — the **🔔** button in the web header asks for
+  browser notification permission (click again to toggle off; the state is
+  remembered per browser via localStorage). While the tab is hidden, each
+  finished run fires a browser notification with the session name and a 150-char
+  snippet of the last assistant message; clicking the notification refocuses
+  the tab. The tab title always shows an ⏳ prefix while a run is in progress
+  (no permission needed). Browsers gate the Notification API behind a secure
+  context, so on plain-HTTP LAN pages the 🔔 button hides itself and only the
+  ⏳ title indicator is available; via `ssh -L` (localhost) or HTTPS it works
+  fully.
 - **Answering agent questions from the web** — when the agent calls
   `ask_user_question` (the rpiv-ask-user-question extension) while a web
   client is connected, the questions appear in a web modal (options, a
@@ -71,16 +105,25 @@ from another machine on your LAN and type messages back into the agent.
 
 ## Tests
 - `npm install` (dev-only type deps), then:
-  - `node selftest.ts` — unit + HTTP-protocol checks (password, tokens/cookie,
-    sanitizer, leaf diff, page syntax + usage/meta formatting, full server
+  - `node selftest.ts` — 156 unit + HTTP-protocol checks (password,
+    tokens/cookie, sanitizer, leaf diff, page syntax + usage/meta formatting,
+    tab-title ⏳ prefix, finish-notification decision matrix, image upload:
+    /input size caps + MIME/count validation, page attach UI, full server
     against a fake pi api, ask bridge: envelope wording, TUI component,
     HTTP ask flow, tool_call hook wiring — first-answer-wins, decline,
-    duplicate 409, client-left fallback).
+    duplicate 409, client-left fallback, agent_settled trailing-entry flush,
+    web-client ordering under the pi persist-after-emit contract, run by
+    driving the real page script in a DOM stub).
   - `npx tsc -p tsconfig.json` — strict type check.
 - Manual e2e checklist: `pi -e ./index.ts` → `/webserve start` → login in a
   browser → watch live streaming → send a message from the web (appears in the
-  TUI) → `/compact` and `/new` from the web (new session shows in the view) →
+  TUI) → attach an image (📎, paste, or drag & drop) and send it (thumbnail
+  shows in the view; the model sees it if vision-capable) → `/compact` and
+  `/new` from the web (new session shows in the view) →
   ask the agent an ambiguous question to trigger `ask_user_question` → answer
   from the web modal (agent continues with the answer; also try answering in
-  the terminal, and with both open at once — first answer wins) → Stop mid-run
-  → `/webserve stop` → second terminal lands on port 8766.
+  the terminal, and with both open at once — first answer wins) → click 🔔
+  (allow), send a message, and hide the tab — a notification arrives when the
+  run finishes (on plain-HTTP LAN the 🔔 is hidden; instead the tab title
+  shows ⏳ while busy) → Stop mid-run → `/webserve stop` → second terminal
+  lands on port 8766.

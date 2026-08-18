@@ -139,8 +139,9 @@ export function diffLeaf(
 // Delivery options for user input (TUI parity). "/" input keeps the proven
 // command path: registered commands execute immediately (even while streaming),
 // skills/prompt templates expand, delivery is followUp while busy. Chat
-// messages steer the running agent like the terminal's Enter; "followUp"
-// mirrors alt+enter (queue until the agent finishes). Idle = direct delivery.
+// messages are delivered with the given mode: the web's Send steers the
+// running agent like the terminal's Enter, while "followUp" (available via
+// the /input API) queues until the agent finishes. Idle = direct delivery.
 export function inputOpts(text: string, idle: boolean, mode: "steer" | "followUp" = "steer"): { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean } {
   const cmd = text.startsWith("/");
   return {
@@ -490,22 +491,44 @@ header .meta .m:first-child::before{content:none;margin:0}
 header button{background:none;border:1px solid #555;color:var(--text);padding:4px 10px;border-radius:6px;cursor:pointer;font:inherit}
 header button#stop{display:none;border-color:#b91c1c}
 header button#stop.show{display:inline-block}
+header button#notif{opacity:.45}
+header button#notif.on{opacity:1;border-color:#60a5fa}
 #msgs{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px}
 .msg{max-width:85%;padding:8px 10px;border-radius:10px;white-space:pre-wrap;word-break:break-word}
 .msg.user{align-self:flex-end;background:var(--user)}
 .msg.assistant{align-self:flex-start;background:var(--asst)}
 .msg.pending{opacity:.7;border:1px dashed #555}
 .msg.pendinguser{opacity:.7;border:1px dashed #555;align-self:flex-end}
+.msg.md{white-space:normal}
+.msg.md p{margin:0 0 6px}
+.msg.md p:last-child{margin-bottom:0}
+.msg.md h1,.msg.md h2,.msg.md h3,.msg.md h4{margin:8px 0 4px;font-size:1.05em;font-weight:700}
+.msg.md ul,.msg.md ol{margin:0 0 6px;padding-left:20px}
+.msg.md li{margin:1px 0}
+.msg.md blockquote{margin:0 0 6px;padding:2px 0 2px 10px;border-left:3px solid #444;color:var(--dim)}
+.msg.md code{background:#0d0d0f;border:1px solid #333;border-radius:4px;padding:0 4px;font-size:12px}
+.msg.md pre{margin:0;padding:8px;background:#0d0d0f;border:1px solid #333;border-radius:6px;white-space:pre-wrap;font-size:12px;color:#c8c8c8}
+.msg.md a{color:#60a5fa}
+.msg.md .codebox{position:relative;margin:0 0 6px}
+.msg.md .codebox:last-child{margin-bottom:0}
+.msg.md .clang{position:absolute;top:4px;left:8px;color:#555;font-size:11px}
+.msg.md .copybtn{position:absolute;top:4px;right:4px;background:#2a2a30;border:1px solid #444;color:var(--dim);border-radius:4px;padding:1px 6px;font-size:11px;cursor:pointer}
+.msg.md .copybtn:hover{color:var(--text)}
 details.tool{align-self:flex-start;max-width:85%;background:var(--tool);border:1px solid #333;border-radius:8px;padding:4px 8px}
 details.tool.err{border-color:#b91c1c}
 details.tool summary{cursor:pointer;color:var(--dim);font-size:12px}
 details.tool pre{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;color:#c8c8c8}
 .note{align-self:center;color:var(--dim);font-size:12px;white-space:pre-wrap}
-footer{display:flex;gap:8px;padding:10px 12px;background:var(--panel);border-top:1px solid #333}
+footer{display:flex;flex-direction:column;gap:8px;padding:10px 12px;background:var(--panel);border-top:1px solid #333}
+#attrow{display:flex;gap:8px}
+#attstrip{display:none;gap:8px;flex-wrap:wrap}
+.att{position:relative;flex:none}
+.att img{width:44px;height:44px;object-fit:cover;border-radius:6px;border:1px solid #444}
+.attx{position:absolute;top:-6px;right:-6px;width:16px;height:16px;border-radius:50%;background:#dc2626;color:#fff;font-size:11px;line-height:16px;text-align:center;cursor:pointer}
+footer button#attach{background:#374151;padding:0 12px}
+.msg img.attimg{display:block;max-width:240px;max-height:200px;border-radius:6px;margin:6px 0 0}
 footer textarea{flex:1;resize:none;height:56px;background:#111;color:var(--text);border:1px solid #444;border-radius:8px;padding:8px;font:inherit}
 footer button{background:var(--user);color:#fff;border:0;border-radius:8px;padding:0 16px;cursor:pointer;font:inherit}
-footer button#queue{display:none;background:#374151}
-footer button#queue.show{display:inline-block}
 #askmask,#modelmask,#treemask{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:50;display:none;align-items:flex-end;justify-content:center}
 #askmask.open,#modelmask.open,#treemask.open{display:flex}
 .askbox{background:var(--panel);border:1px solid #444;border-radius:12px;width:100%;max-width:640px;max-height:85vh;overflow-y:auto;padding:14px}
@@ -530,23 +553,87 @@ footer button#queue.show{display:inline-block}
 <header>
 <div class="dot" id="dot"></div>
 <span class="meta" id="meta"></span>
+<button id="notif" title="Ping when a run finishes (tab must stay open)">🔔</button>
 <button id="stop">Stop</button>
 <button id="logout">Logout</button>
 </header>
 <div id="msgs"></div>
 <footer>
+<div id="attstrip"></div>
+<div id="attrow">
 <textarea id="input" placeholder="Message..."></textarea>
-<button id="queue">Queue</button>
+<button id="attach" title="Attach images: png, jpeg, webp, gif — up to 4 MB each, 3 per message. Paste or drop also works.">📎</button>
 <button id="send">Send</button>
+<input type="file" id="attachfile" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+</div>
 </footer>
 <script>
 var msgs = document.getElementById('msgs'),
     input = document.getElementById('input'),
     dot = document.getElementById('dot'),
     metaEl = document.getElementById('meta'),
-    stopBtn = document.getElementById('stop'),
-    queueBtn = document.getElementById('queue');
+    stopBtn = document.getElementById('stop');
 var curMeta = {}, pendingEl = null, userQ = [];
+var busy = false, notifOn = false;
+
+// --- image attachments: 📎 button, paste, or drag & drop onto the input ---
+var attachBtn = document.getElementById('attach'),
+    attachFile = document.getElementById('attachfile'),
+    attStrip = document.getElementById('attstrip');
+var attachments = []; // {data, mimeType} base64 images waiting to be sent
+var IMG_TYPES = { 'image/png': 1, 'image/jpeg': 1, 'image/webp': 1, 'image/gif': 1 };
+function imgThumbs(parts) {
+  // whitelisted mime types only: the value goes into an img src attribute
+  var h = '';
+  (parts || []).forEach(function (p) {
+    var s = p && p.data && IMG_TYPES[p.mimeType] ? 'data:' + p.mimeType + ';base64,' + p.data : '';
+    if (s) h += '<img class="attimg" src="' + s + '">';
+  });
+  return h;
+}
+function renderAtt() {
+  attStrip.innerHTML = '';
+  attachments.forEach(function (a, i) {
+    var d = document.createElement('div');
+    d.className = 'att';
+    var img = document.createElement('img');
+    img.src = 'data:' + a.mimeType + ';base64,' + a.data;
+    var x = document.createElement('span');
+    x.className = 'attx';
+    x.textContent = '×';
+    x.onclick = function () { attachments.splice(i, 1); renderAtt(); };
+    d.appendChild(img);
+    d.appendChild(x);
+    attStrip.appendChild(d);
+  });
+  attStrip.style.display = attachments.length ? 'flex' : 'none';
+}
+function addFiles(files) {
+  Array.prototype.slice.call(files || []).forEach(function (f) {
+    if (!IMG_TYPES[f.type]) { alert('unsupported image type: ' + f.type); return; }
+    if (f.size > 4 * 1024 * 1024) { alert('image too large (max 4 MB): ' + (f.name || f.type)); return; }
+    if (attachments.length >= 3) { alert('max 3 images per message'); return; }
+    var r = new FileReader();
+    r.onload = function () {
+      var u = String(r.result);
+      attachments.push({ data: u.slice(u.indexOf(',') + 1), mimeType: f.type });
+      renderAtt();
+    };
+    r.readAsDataURL(f);
+  });
+}
+attachBtn.addEventListener('click', function () { attachFile.value = ''; attachFile.click(); });
+attachFile.addEventListener('change', function () { if (attachFile.files.length) addFiles(attachFile.files); });
+input.addEventListener('paste', function (e) {
+  var fs = e.clipboardData && e.clipboardData.files;
+  if (fs && fs.length) { e.preventDefault(); addFiles(fs); }
+});
+input.addEventListener('dragover', function (e) { e.preventDefault(); });
+input.addEventListener('drop', function (e) {
+  e.preventDefault();
+  var fs = e.dataTransfer && e.dataTransfer.files;
+  if (fs && fs.length) addFiles(fs);
+});
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, function (c) {
@@ -561,6 +648,81 @@ function textOf(c) {
   if (Array.isArray(c)) return c.filter(function (x) { return x && x.type === 'text'; })
     .map(function (x) { return x.text || ''; }).join('');
   return '';
+}
+// --- markdown rendering for assistant text (applied on finalize, not per
+// token — half-closed fences would flicker while streaming) ---
+// esc() runs first, so model output can never inject HTML; the only tags in
+// the result are the ones we add. Backticks are matched via double-backslash
+// unicode escapes because this page lives in a TS template literal and must
+// not contain raw backticks.
+function mdInline(t) {
+  var codes = [];
+  t = t.replace(/\\u0060([^\\u0060]+)\\u0060/g, function (m, c) {
+    codes.push(c);
+    return "\\x00C" + (codes.length - 1) + "\\x00";
+  });
+  t = t.replace(/\\*\\*([^*\\n]+)\\*\\*/g, "<strong>$1</strong>");
+  t = t.replace(/(^|[^*])\\*([^*\\s][^*\\n]*)\\*(?!\\*)/g, "$1<em>$2</em>");
+  t = t.replace(/\\[([^\\]\\n]+)\\]\\(([^)\\s]+)\\)/g, function (m, text, url) {
+    if (/^https?:\\/\\//.test(url) || /^mailto:/.test(url)) return '<a href="' + url + '" target="_blank" rel="noopener">' + text + "</a>";
+    return m;
+  });
+  return t.replace(/\\x00C(\\d+)\\x00/g, function (m, i) { return "<code>" + codes[Number(i)] + "</code>"; });
+}
+function md(src) {
+  var fenceRe = /^ {0,3}\\u0060{3}(\\w*)\\s*$/;
+  var headRe = /^ {0,3}(#{1,4}) +(.*)$/;
+  var quoteRe = /^ {0,3}&gt; ?(.*)$/;
+  var ulRe = /^ {0,3}[-*+] +(.*)$/;
+  var olRe = /^ {0,3}\\d+\\. +(.*)$/;
+  var lines = esc(src).split("\\n");
+  var out = [];
+  var para = [];
+  var list = null;
+  var items = [];
+  var quote = [];
+  var code = null;
+  function codeHtml(c) {
+    var lang = c.lang ? '<span class="clang">' + c.lang + "</span>" : "";
+    return '<div class="codebox">' + lang + '<button type="button" class="copybtn">copy</button><pre>' + c.lines.join("\\n") + "</pre></div>";
+  }
+  function flushPara() {
+    if (para.length > 0) { out.push("<p>" + para.map(mdInline).join("<br>") + "</p>"); para = []; }
+  }
+  function flushList() {
+    if (list === null) return;
+    out.push("<" + list + ">" + items.map(function (x) { return "<li>" + mdInline(x) + "</li>"; }).join("") + "</" + list + ">");
+    list = null;
+    items = [];
+  }
+  function flushQuote() {
+    if (quote.length > 0) { out.push("<blockquote>" + quote.map(mdInline).join("<br>") + "</blockquote>"); quote = []; }
+  }
+  function flushAll() { flushPara(); flushList(); flushQuote(); }
+  for (var i = 0; i < lines.length; i++) {
+    var ln = lines[i].replace(/\\r$/, "");
+    if (code) {
+      if (fenceRe.test(ln)) { out.push(codeHtml(code)); code = null; }
+      else code.lines.push(ln);
+      continue;
+    }
+    var m = fenceRe.exec(ln);
+    if (m) { flushAll(); code = { lang: m[1] || "", lines: [] }; continue; }
+    if (ln.replace(/\\s/g, "") === "") { flushAll(); continue; }
+    m = headRe.exec(ln);
+    if (m) { flushAll(); var lvl = m[1].length; out.push("<h" + lvl + ">" + mdInline(m[2]) + "</h" + lvl + ">"); continue; }
+    m = quoteRe.exec(ln);
+    if (m) { flushPara(); flushList(); quote.push(m[1]); continue; }
+    m = ulRe.exec(ln);
+    if (m) { flushPara(); flushQuote(); if (list !== "ul") { flushList(); list = "ul"; } items.push(m[1]); continue; }
+    m = olRe.exec(ln);
+    if (m) { flushPara(); flushQuote(); if (list !== "ol") { flushList(); list = "ol"; } items.push(m[1]); continue; }
+    flushQuote(); flushList();
+    para.push(ln);
+  }
+  if (code) out.push(codeHtml(code));
+  flushAll();
+  return out.join("");
 }
 function addMsg(role, html, cls) {
   var d = document.createElement('div');
@@ -605,13 +767,34 @@ function updateMetaLine() {
   var u = usageText(curMeta.usage);
   if (u) segs.push(metaSeg('m m-usage', u));
   for (var i = 0; i < segs.length; i++) metaEl.appendChild(segs[i]);
-  if (curMeta.sessionName) document.title = curMeta.sessionName;
+  document.title = (busy ? '⏳ ' : '') + (curMeta.sessionName || 'pi session');
+}
+function storeGet(k) {
+  try { return localStorage.getItem(k); } catch (e) { return null; }
+}
+function storeSet(k, v) {
+  try { localStorage.setItem(k, v); } catch (e) {}
+}
+function notifyDone() {
+  if (!notifOn || typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  if (!document.hidden) return;
+  try {
+    var name = curMeta.sessionName || 'pi session';
+    var body = '';
+    var els = msgs.querySelectorAll('.msg.assistant.md');
+    if (els.length > 0) body = (els[els.length - 1].textContent || '').slice(0, 150);
+    var n = new Notification('pi: ' + name, body ? { body: body } : undefined);
+    n.onclick = function () { window.focus(); n.close(); };
+  } catch (e) {}
 }
 function setBusy(b) {
+  var was = busy;
+  busy = b;
   dot.classList.toggle('busy', b);
   stopBtn.classList.toggle('show', b);
-  queueBtn.classList.toggle('show', b);
-  input.placeholder = b ? 'Agent busy — Send steers this run · Queue waits' : 'Message...';
+  input.placeholder = b ? 'Agent busy — Send steers this run' : 'Message...';
+  document.title = (busy ? '⏳ ' : '') + (curMeta.sessionName || 'pi session');
+  if (was && !b) notifyDone();
 }
 function toolEl(id, name, state) {
   var el = document.getElementById('call-' + id);
@@ -634,13 +817,22 @@ function renderEntry(en) {
     var m = en.message;
     if (m.role === 'user') {
       var t = textOf(m.content);
+      var imgParts = Array.isArray(m.content) ? m.content.filter(function (p) { return p && p.type === 'image'; }) : [];
       var i = 0, hit = null;
-      for (; i < userQ.length; i++) { if (userQ[i].text === t) { hit = userQ[i]; break; } }
+      for (; i < userQ.length; i++) {
+        if (userQ[i].text === t && (userQ[i].images || []).length === imgParts.length) { hit = userQ[i]; break; }
+      }
       if (hit) {
         userQ.splice(i, 1);
         hit.el.classList.remove('pendinguser');
+        // pi 0.84.x persists a message only after its message_end handlers ran,
+        // so this entry's append reaches us AFTER the reply's streaming bubble
+        // was positioned above the still-pending bubble (tail() puts agent
+        // content before queued user bubbles). Move the bubble ahead of the
+        // streaming bubble to keep chat order: user, then its answer.
+        if (pendingEl) msgs.insertBefore(hit.el, pendingEl);
       } else {
-        addMsg('user', esc(t));
+        addMsg('user', esc(t) + imgThumbs(imgParts));
       }
     } else if (m.role === 'assistant') {
       var texts = [];
@@ -658,11 +850,12 @@ function renderEntry(en) {
       });
       var full = texts.join('');
       if (pendingEl) {
-        // finalize the streaming bubble in place so it keeps its position
-        if (full) { pendingEl.classList.remove('pending'); pendingEl.textContent = full; }
+        // finalize the streaming bubble in place so it keeps its position;
+        // swap the raw streaming text for rendered markdown
+        if (full) { pendingEl.classList.remove('pending'); pendingEl.classList.add('md'); pendingEl.innerHTML = md(full); }
         else { pendingEl.remove(); }
         pendingEl = null;
-      } else if (full) { addMsg('assistant', esc(full)); }
+      } else if (full) { addMsg('assistant', md(full), 'md'); }
     } else if (m.role === 'toolResult') {
       var out = textOf(m.content);
       // ask bridge: pi flags blocked calls isError, but an answered/declined
@@ -1036,31 +1229,88 @@ es.addEventListener('treepick', function (e) { showTreePick(JSON.parse(e.data));
 treeMask.addEventListener('click', function (e) { if (e.target === treeMask) hideTreePick(); });
 
 function sendText(t, mode) {
-  if (!t) return;
+  if (!t && !attachments.length) return;
   input.value = '';
-  var el = addMsg('user', esc(t), 'pendinguser');
-  userQ.push({ el: el, text: t });
+  var imgs = attachments; attachments = []; renderAtt();
+  if (t.charAt(0) === '/' && imgs.length) { imgs = []; alert('commands cannot carry images'); }
+  var el = addMsg('user', esc(t) + imgThumbs(imgs), 'pendinguser');
+  userQ.push({ el: el, text: t, images: imgs });
   fetch('/input', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text: t, mode: mode || 'steer' })
+    body: JSON.stringify({ text: t, mode: mode || 'steer', images: imgs })
   }).then(function (r) {
     if (!r.ok) return r.json().then(function (d) { alert('send failed: ' + (d.error || r.status)); });
   }).catch(function (err) { alert('send failed: ' + err); });
 }
-// TUI parity: Enter steers the running agent, alt+enter queues a follow-up.
+// Enter steers the running agent like the terminal does; the web has no
+// queue path.
 function send() { sendText(input.value.trim(), 'steer'); }
 input.addEventListener('keydown', function (e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(input.value.trim(), e.altKey ? 'followUp' : 'steer'); }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(input.value.trim(), 'steer'); }
 });
 document.getElementById('send').addEventListener('click', send);
-queueBtn.addEventListener('click', function () { sendText(input.value.trim(), 'followUp'); });
+// Copy buttons on rendered code blocks (delegated). The clipboard API needs a
+// secure context; a plain-HTTP LAN falls back to execCommand.
+function copyFallback(t) {
+  var ta = document.createElement('textarea');
+  ta.value = t;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  var ok = false;
+  try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+  document.body.removeChild(ta);
+  return ok;
+}
+msgs.addEventListener('click', function (e) {
+  var b = e.target;
+  if (!b || b.className !== 'copybtn') return;
+  var pre = b.parentNode && b.parentNode.querySelector ? b.parentNode.querySelector('pre') : null;
+  if (!pre) return;
+  var t = pre.textContent;
+  var done = function (ok) {
+    b.textContent = ok ? 'copied' : 'copy failed';
+    setTimeout(function () { b.textContent = 'copy'; }, 1500);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(t).then(function () { done(true); }, function () { done(copyFallback(t)); });
+  } else {
+    done(copyFallback(t));
+  }
+});
 stopBtn.addEventListener('click', function () {
   fetch('/stop', { method: 'POST' }).then(function () { setBusy(false); });
 });
 document.getElementById('logout').addEventListener('click', function () {
   fetch('/logout', { method: 'POST' }).then(function () { location.reload(); });
 });
+// Notification API needs a secure context (localhost/https); on plain-HTTP LAN
+// the button hides itself and the ⏳ tab-title indicator covers in-progress runs.
+var notifBtn = document.getElementById('notif');
+if (typeof Notification === 'undefined' || Notification.permission === 'denied') {
+  notifBtn.style.display = 'none';
+} else {
+  notifOn = Notification.permission === 'granted' && storeGet('piCockpitNotif') !== '0';
+  notifBtn.classList.toggle('on', notifOn);
+  notifBtn.addEventListener('click', function () {
+    var apply = function (on) {
+      notifOn = on;
+      storeSet('piCockpitNotif', on ? '1' : '0');
+      notifBtn.classList.toggle('on', on);
+    };
+    if (Notification.permission === 'granted') { apply(!notifOn); return; }
+    var done = function (p) {
+      if (p === 'granted') apply(true), addNote('Notifications on — a finished run pings you while this tab is hidden');
+      else addNote('Notifications blocked — allow them in your browser site settings');
+    };
+    var r;
+    try { r = Notification.requestPermission(function (p) { if (!r || typeof r.then !== 'function') done(p); }); }
+    catch (e) { r = null; }
+    if (r && typeof r.then === 'function') r.then(done);
+  });
+}
 </script>
 </body>
 </html>`;
@@ -1070,7 +1320,13 @@ document.getElementById('logout').addEventListener('click', function () {
 // ---------------------------------------------------------------------------
 
 const BODY_LIMIT = 100 * 1024;   // spec: 100 KB body limit
+// deviation from the spec's 100 KB body limit: /input also carries base64
+// images, so only /input gets a larger cap (up to 3 images x ~6 MB base64).
+const INPUT_BODY_LIMIT = 12 * 1024 * 1024;
 const INPUT_LIMIT = 32 * 1024;   // spec: input text 32 KB
+const MAX_IMAGES = 3;
+const MAX_IMAGE_B64 = 6 * 1024 * 1024; // ≈ 4.5 MB raw per image
+const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const KEEPALIVE_MS = 15000;      // spec: SSE keep-alive comment every 15s
 
 export interface SnapshotMeta {
@@ -1085,7 +1341,7 @@ export interface SnapshotMeta {
 export interface WebApi {
   getSnapshot(): { entries: AnyRec[]; meta: SnapshotMeta };
   allEntries(): Map<string, AnyRec>;
-  sendInput(text: string, mode?: "steer" | "followUp"): Promise<{ queued: boolean }>;
+  sendInput(text: string, mode?: "steer" | "followUp", images?: ImageInput[]): Promise<{ queued: boolean }>;
   stopAgent(): { aborted: boolean };
 }
 
@@ -1138,6 +1394,24 @@ function readBody(req: http.IncomingMessage, limit: number): Promise<string> {
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     req.on("error", reject);
   });
+}
+
+/** Image attached to a web message: base64 data + MIME type. */
+export type ImageInput = { data: string; mimeType: string };
+
+/** Validates the `images` field of an /input body; returns the images or an error message. */
+function parseImages(v: unknown): { ok: ImageInput[] } | { ok: null; error: string } {
+  if (v === undefined || v === null) return { ok: [] };
+  if (!Array.isArray(v) || v.length > MAX_IMAGES) return { ok: null, error: "too many images (max " + MAX_IMAGES + ")" };
+  const out: ImageInput[] = [];
+  for (const it of v) {
+    const r = it as { data?: unknown; mimeType?: unknown } | null | undefined;
+    if (!r || typeof r.mimeType !== "string" || !IMAGE_TYPES.has(r.mimeType) || typeof r.data !== "string" || !r.data)
+      return { ok: null, error: "bad image" };
+    if (r.data.length > MAX_IMAGE_B64) return { ok: null, error: "image too large (max ~4.5 MB)" };
+    out.push({ data: r.data, mimeType: r.mimeType });
+  }
+  return { ok: out };
 }
 
 function json(res: http.ServerResponse, status: number, obj: unknown, headers: Record<string, string> = {}): void {
@@ -1266,14 +1540,16 @@ export function startServer(opts: {
         return;
       }
       if (req.method === "POST" && url === "/input") {
-        const raw = await readBody(req, BODY_LIMIT);
+        const raw = await readBody(req, INPUT_BODY_LIMIT);
         const body = parseJsonBody(raw);
         if (!body) { json(res, 400, { error: "bad json" }); return; }
         const text = typeof body.text === "string" ? (body.text as string).trim() : "";
-        if (!text) { json(res, 400, { error: "empty message" }); return; }
+        const img = parseImages(body.images);
+        if (img.ok === null) { json(res, 400, { error: img.error }); return; }
+        if (!text && img.ok.length === 0) { json(res, 400, { error: "empty message" }); return; }
         if (text.length > INPUT_LIMIT) { json(res, 400, { error: "message too long" }); return; }
         const mode = body.mode === "followUp" ? "followUp" : "steer";
-        const r = await api.sendInput(text, mode);
+        const r = await api.sendInput(text, mode, img.ok);
         json(res, 200, { ok: true, queued: r.queued });
         return;
       }
@@ -1480,13 +1756,21 @@ export default function (pi: ExtensionAPI): void {
       }
       return m;
     },
-    async sendInput(text, mode: "steer" | "followUp" = "steer") {
+    async sendInput(text, mode: "steer" | "followUp" = "steer", images: ImageInput[] = []) {
       const ctx = curCtx;
       const p = curPi;
       if (!ctx || !p) throw noCtxError();
       const idle = ctx.isIdle();
       const opts = inputOpts(text, idle, mode);
-      p.sendUserMessage(text, opts);
+      if (images.length) {
+        // Images (base64 png/jpeg/webp/gif) ride as ImageContent parts alongside text.
+        const parts: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [];
+        if (text) parts.push({ type: "text", text });
+        for (const im of images) parts.push({ type: "image", data: im.data, mimeType: im.mimeType });
+        p.sendUserMessage(parts, opts);
+      } else {
+        p.sendUserMessage(text, opts);
+      }
       return { queued: !idle && opts.deliverAs === "followUp" };
     },
     stopAgent() {
@@ -1548,7 +1832,16 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_tree", (_e, ctx) => { curCtx = ctx; changed(); });
   pi.on("session_info_changed", (_e, ctx) => { curCtx = ctx; changed(); });
   pi.on("agent_start", (_e, ctx) => { curCtx = ctx; server?.broadcast("status", { busy: true }); });
-  pi.on("agent_settled", (_e, ctx) => { curCtx = ctx; server?.broadcast("status", { busy: false }); server?.broadcast("meta", { usage: ctx.getContextUsage() ?? null }); });
+  pi.on("agent_settled", (_e, ctx) => {
+    curCtx = ctx;
+    server?.broadcast("status", { busy: false });
+    server?.broadcast("meta", { usage: ctx.getContextUsage() ?? null });
+    // pi persists each message after its message_end handlers ran, so the run's
+    // trailing entry was one leaf behind; the run is fully settled and persisted
+    // now, so flush it and let the final message finalize as markdown without
+    // waiting for the next interaction.
+    changed();
+  });
 
   // --- ask_user_question bridge: web + terminal, first answer wins ---
   // The rpiv-ask-user-question tool would otherwise block on a TUI overlay in

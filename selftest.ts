@@ -3,7 +3,7 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { hashPassword, verifyPassword, issueToken, cookieHeader, clearCookieHeader, tokenFromCookie, sanitizeEntry, diffLeaf, inputOpts, startServer, default as piCockpit, type AnyRec, LOGIN_PAGE, CHAT_PAGE, buildAskEnvelope, extractAskQuestions, AskTuiComponent, ASK_RESERVED_LABELS, type AskQuestion, type AskOutcome } from "./index.ts";
+import { hashPassword, verifyPassword, issueToken, cookieHeader, clearCookieHeader, tokenFromCookie, sanitizeEntry, diffLeaf, inputOpts, startServer, default as piCockpit, type AnyRec, type ImageInput, LOGIN_PAGE, CHAT_PAGE, buildAskEnvelope, extractAskQuestions, AskTuiComponent, ASK_RESERVED_LABELS, type AskQuestion, type AskOutcome } from "./index.ts";
 
 let failed = 0, passed = 0;
 function check(name: string, cond: boolean): void {
@@ -120,8 +120,15 @@ function check(name: string, cond: boolean): void {
     CHAT_PAGE.includes("addEventListener('treepick'") && CHAT_PAGE.includes("sendText('/tree '") &&
     CHAT_PAGE.includes("'treemask'"));
 
-  check("page: Queue button (busy only) sends followUp; default send steers",
-    CHAT_PAGE.includes('id="queue"') && CHAT_PAGE.includes("'followUp'") && CHAT_PAGE.includes("'steer'"));
+  check("page: send is steer-only, no Queue button or followUp path",
+    CHAT_PAGE.includes("'steer'") && !CHAT_PAGE.includes("id=\"queue\"") && !CHAT_PAGE.includes("'followUp'"));
+
+  check("page: attach UI present (button, file input, strip, paste/drop handlers)",
+    CHAT_PAGE.includes('id="attach"') && CHAT_PAGE.includes('type="file"') && CHAT_PAGE.includes('id="attstrip"') &&
+    CHAT_PAGE.includes("addEventListener('paste'") && CHAT_PAGE.includes("addEventListener('drop'"));
+
+  check("page: /input body carries images; user entries render thumbnails",
+    CHAT_PAGE.includes("images: imgs") && CHAT_PAGE.includes("attimg"));
 
   const metaSegSrc = fnSrc("metaSeg");
   const upMetaSrc = fnSrc("updateMetaLine");
@@ -131,10 +138,10 @@ function check(name: string, cond: boolean): void {
     return { children, textContent: "", className: "", appendChild: (c) => { children.push(c); } };
   };
   const fakeDoc = { title: "", createElement: () => fakeEl() };
-  const runMeta = (cm: Record<string, unknown>): FakeEl =>
-    (new Function("document", "curMeta", "metaEl",
+  const runMeta = (cm: Record<string, unknown>, busy = false): FakeEl =>
+    (new Function("document", "curMeta", "metaEl", "busy",
       fmtSrc + "\n" + usageSrc + "\n" + metaSegSrc + "\n" + upMetaSrc +
-      "\nupdateMetaLine(); return metaEl;")(fakeDoc, cm, fakeEl()) as FakeEl);
+      "\nupdateMetaLine(); return metaEl;")(fakeDoc, cm, fakeEl(), busy) as FakeEl);
 
   const el1 = metaSegSrc && upMetaSrc ? runMeta({ sessionName: "s1", model: "p/m", cwd: "/w", usage: { tokens: 45321, contextWindow: 200000, percent: 22.66 } }) : null;
   check("page: meta line builds segment spans incl. usage",
@@ -144,6 +151,85 @@ function check(name: string, cond: boolean): void {
   const el2 = metaSegSrc && upMetaSrc ? runMeta({ sessionName: null, model: "", cwd: "/w", usage: null }) : null;
   check("page: meta line omits usage segment when absent",
     !!el2 && el2.children.length === 3 && el2.children[0].textContent === "pi session");
+
+  const titleFn = fmtSrc && usageSrc && metaSegSrc && upMetaSrc
+    ? new Function("document", "curMeta", "metaEl", "busy",
+        fmtSrc + "\n" + usageSrc + "\n" + metaSegSrc + "\n" + upMetaSrc +
+        "\nupdateMetaLine(); return document.title;")
+    : null;
+  const titleBusy = titleFn
+    ? (titleFn(fakeDoc, { sessionName: "s1", model: "p/m", cwd: "/w", usage: null }, fakeEl(), true) as string)
+    : "";
+  const titleIdle = titleFn
+    ? (titleFn(fakeDoc, { sessionName: "s1", model: "p/m", cwd: "/w", usage: null }, fakeEl(), false) as string)
+    : "";
+  check("page: tab title gets ⏳ prefix while busy, plain session name when idle",
+    titleBusy === "⏳ s1" && titleIdle === "s1");
+
+  // notifyDone: fires only when enabled + permission granted + tab hidden
+  const ndSrc = fnSrc("notifyDone");
+  const ndRun = (on: boolean, hidden: boolean, permission: string): Array<{ title: string; opts: unknown }> => {
+    if (!ndSrc) return [];
+    const calls: Array<{ title: string; opts: unknown }> = [];
+    function C(this: { title: string; opts: unknown }, title: string, opts: unknown) {
+      this.title = title;
+      this.opts = opts;
+      calls.push({ title, opts });
+    }
+    (C as unknown as { permission: string }).permission = permission;
+    (new Function("notifOn", "document", "Notification", "curMeta", "msgs",
+      ndSrc + "\nnotifyDone();"))(on, { hidden }, C, { sessionName: "s1" },
+      { querySelectorAll: () => [{ textContent: "All done — tests pass" }] });
+    return calls;
+  };
+  check("notify: hidden tab + granted + on fires one notification with name and last-assistant snippet",
+    JSON.stringify(ndRun(true, true, "granted")) ===
+    JSON.stringify([{ title: "pi: s1", opts: { body: "All done — tests pass" } }]));
+  check("notify: visible tab does not fire", ndRun(true, false, "granted").length === 0);
+  check("notify: off does not fire", ndRun(false, true, "granted").length === 0);
+  check("notify: ungranted permission does not fire", ndRun(true, true, "default").length === 0);
+  check("page: 🔔 button present, hidden when Notification unavailable or denied",
+    CHAT_PAGE.includes('id="notif"') &&
+    CHAT_PAGE.includes("typeof Notification === 'undefined'") &&
+    CHAT_PAGE.includes("Notification.permission === 'denied'"));
+
+  // --- markdown renderer: extracted page functions, run in a sandbox ---
+  const escSrc = fnSrc("esc");
+  const inlineSrc = fnSrc("mdInline");
+  const mdSrc = fnSrc("md");
+  const md = escSrc && inlineSrc && mdSrc
+    ? (new Function(escSrc + "\n" + inlineSrc + "\n" + mdSrc + "\n; return md;")() as (s: string) => string)
+    : null;
+  check("md: fenced code -> codebox with copy button, contents unstyled",
+    !!md && md("```js\nconst a = 1; // **not** styled\n```") ===
+      '<div class="codebox"><span class="clang">js</span><button type="button" class="copybtn">copy</button><pre>const a = 1; // **not** styled</pre></div>');
+  check("md: headings render h1-h4", !!md && md("## Title") === "<h2>Title</h2>");
+  check("md: bold, italic, inline code",
+    !!md && md("**b** and *i* and `c`") === "<p><strong>b</strong> and <em>i</em> and <code>c</code></p>");
+  check("md: inline code content is not styled",
+    !!md && md("a `**x**` b") === "<p>a <code>**x**</code> b</p>");
+  check("md: https link becomes anchor, javascript: URL stays literal",
+    !!md && md("see [docs](https://x.dev/a) now") ===
+      '<p>see <a href="https://x.dev/a" target="_blank" rel="noopener">docs</a> now</p>' &&
+      md("click [x](javascript:alert(1))") === "<p>click [x](javascript:alert(1))</p>");
+  check("md: html in source stays escaped",
+    !!md && md("<script>alert(1)</script> **b**") ===
+      "<p>&lt;script&gt;alert(1)&lt;/script&gt; <strong>b</strong></p>" &&
+      !md("<script></script>").includes("<script>"));
+  check("md: ul/ol lists separated from surrounding paragraph",
+    !!md && md("a\n- one\n- two\n1. first") ===
+      "<p>a</p><ul><li>one</li><li>two</li></ul><ol><li>first</li></ol>");
+  check("md: blockquote", !!md && md("> quoted line") === "<blockquote>quoted line</blockquote>");
+  check("md: plain lines join with <br> in one paragraph",
+    !!md && md("line one\nline two") === "<p>line one<br>line two</p>");
+  check("md: unclosed fence still shows the code",
+    !!md && md("```js\nconst a = 1;").includes("<pre>const a = 1;</pre>"));
+  check("page: assistant finalize renders markdown; streaming stays plain text",
+    CHAT_PAGE.includes("pendingEl.innerHTML = md(full)") &&
+    CHAT_PAGE.includes("addMsg('assistant', md(full), 'md')") &&
+    CHAT_PAGE.includes("pendingEl.textContent = textOf(m.content)"));
+  check("page: codebox copy button wired (clipboard + execCommand fallback)",
+    CHAT_PAGE.includes("copybtn") && CHAT_PAGE.includes("execCommand('copy')"));
 }
 
 // ---------- ask_user_question bridge: envelope + extractor ----------
@@ -247,7 +333,7 @@ async function httpTests(): Promise<void> {
     { type: "message", id: "b", parentId: "a", timestamp: "2", message: { role: "assistant", content: [{ type: "text", text: "hello" }] } },
   ];
   const byId = new Map(entries.map((e) => [e.id as string, e]));
-  const sent: string[] = [];
+  const sent: Array<{ text: string; images: ImageInput[] }> = [];
   let stopCalls = 0;
   const api = {
     getSnapshot: () => ({
@@ -255,7 +341,7 @@ async function httpTests(): Promise<void> {
       meta: { cwd: "/tmp", model: "p/m", sessionName: null, leafId: entries.length ? entries[entries.length - 1].id as string : null, usage: { tokens: null, contextWindow: 200000, percent: null } },
     }),
     allEntries: () => byId,
-    sendInput: async (t: string) => { sent.push(t); return { queued: true }; },
+    sendInput: async (t: string, _mode?: "steer" | "followUp", images?: ImageInput[]) => { sent.push({ text: t, images: images ?? [] }); return { queued: true }; },
     stopAgent: () => { stopCalls++; return { aborted: true }; },
   };
   const tokens = new Set<string>();
@@ -285,7 +371,7 @@ async function httpTests(): Promise<void> {
   // Direct await, same condition.
   const inputOk = await fetch(base + "/input", { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify({ text: "hello agent" }) });
   check("http: /input ok -> 200 queued",
-    inputOk.status === 200 && ((await inputOk.json()) as { queued?: boolean }).queued === true && sent[0] === "hello agent");
+    inputOk.status === 200 && ((await inputOk.json()) as { queued?: boolean }).queued === true && sent[0].text === "hello agent" && sent[0].images.length === 0);
 
   check("http: /input without cookie -> 401",
     (await fetch(base + "/input", { method: "POST", body: JSON.stringify({ text: "x" }) })).status === 401);
@@ -296,8 +382,32 @@ async function httpTests(): Promise<void> {
   check("http: /input bad json -> 400",
     (await fetch(base + "/input", { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: "{nope" })).status === 400);
 
-  check("http: /input oversized -> 413",
-    (await fetch(base + "/input", { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify({ text: "x".repeat(200000) }) })).status === 413);
+  const IMG1: ImageInput = { data: "iVBORw0KGgo=", mimeType: "image/png" }; // tiny base64 png
+  const postInput = (body: unknown) =>
+    fetch(base + "/input", { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify(body) });
+
+  check("http: /input with image -> 200, image passed through",
+    (await postInput({ text: "see this", images: [IMG1] })).status === 200 &&
+    sent[sent.length - 1].text === "see this" &&
+    sent[sent.length - 1].images[0].data === IMG1.data && sent[sent.length - 1].images[0].mimeType === "image/png");
+
+  check("http: /input image only (no text) -> 200",
+    (await postInput({ images: [IMG1] })).status === 200);
+
+  check("http: /input disallowed image type (svg) -> 400",
+    (await postInput({ text: "x", images: [{ data: "PHN2Zz4=", mimeType: "image/svg+xml" }] })).status === 400);
+
+  check("http: /input more than 3 images -> 400",
+    (await postInput({ text: "x", images: [IMG1, IMG1, IMG1, IMG1] })).status === 400);
+
+  check("http: /input oversized image data -> 400",
+    (await postInput({ text: "x", images: [{ data: "A".repeat(6 * 1024 * 1024 + 1), mimeType: "image/png" }] })).status === 400);
+
+  check("http: /input >32KB text -> 400",
+    (await postInput({ text: "x".repeat(200000) })).status === 400);
+
+  check("http: /input >12MB body -> 413",
+    (await postInput({ text: "x", images: [{ data: "A".repeat(13 * 1024 * 1024), mimeType: "image/png" }] })).status === 413);
 
   const st = await fetch(base + "/stop", { method: "POST", headers: { cookie } });
   check("http: /stop -> 200 + stopAgent called", st.status === 200 && stopCalls === 1);
@@ -320,7 +430,7 @@ check("inputOpts: non-slash input never expands",
   inputOpts("hello", false).expandPromptTemplates === false && inputOpts("hello", true).expandPromptTemplates === false);
 check("inputOpts: busy chat input steers by default (TUI Enter parity)",
   inputOpts("hello", false).deliverAs === "steer");
-check("inputOpts: busy chat input can queue as followUp (TUI alt+enter parity)",
+check("inputOpts: busy chat input can queue as followUp via the /input mode",
   inputOpts("hello", false, "followUp").deliverAs === "followUp");
 check("inputOpts: busy slash input keeps the command path (followUp); idle delivers directly",
   inputOpts("/new", false).deliverAs === "followUp" && inputOpts("/new", true).deliverAs === undefined && inputOpts("hello", true).deliverAs === undefined);
@@ -711,6 +821,18 @@ async function wiringTests(): Promise<void> {
     check("wiring: web /tree unknown entry notes an error",
       client.get().includes("Entry nope not found") && c1.navCalls.length === 3);
 
+    // pi 0.84.x persists each message only AFTER its message_end handlers ran,
+    // so the run's trailing entry is one leaf behind and never reaches web
+    // clients until the next leaf change; agent_settled must flush it, or the
+    // final message stays a raw streaming bubble until the next interaction.
+    const beforeE9 = client.get().length;
+    c1.ctx.sessionManager.getEntries().push({ type: "message", id: "e9", parentId: "e1", timestamp: "9", message: { role: "assistant", content: [{ type: "text", text: "final answer" }] } });
+    await c1.ctx.navigateTree("e9"); // simulate pi's persist step: the leaf advances
+    fake1.emit("agent_settled", { type: "agent_settled" }, c1.ctx);
+    await waitUntil('"id":"e9"', 3000);
+    check("wiring: agent_settled flushes the run's trailing entry to web clients",
+      client.get().slice(beforeE9).includes('"id":"e9"'));
+
     // session replacement: the OLD closure gets shutdown, a NEW factory
     // invocation gets session_start (exactly what pi does on /new)
     fake1.emit("session_shutdown", { type: "session_shutdown", reason: "new" }, c1.ctx);
@@ -880,6 +1002,134 @@ async function wiringTests(): Promise<void> {
 }
 
 await wiringTests();
+
+// --- phase 4: web client ordering under pi 0.84.x's persist-after-emit contract ---
+// pi emits the extension's message_end handlers BEFORE persisting the message
+// (AgentSession._handleAgentEvent), and the agent loop serializes events, so a
+// web client always receives the reply's first `update` BEFORE the user entry's
+// `append` (which only goes out on the next leaf change). The page must still
+// end with the user bubble ABOVE its answer, finalized as markdown. This runs
+// the real CHAT_PAGE script against a minimal DOM stub and feeds it exactly
+// the wire order pi 0.84.x produces.
+async function clientOrderingTest(): Promise<void> {
+  // --- minimal DOM stub: only what the page script actually touches ---
+  type E = any;
+  const allEls: E[] = [];
+  const mkEl = (): E => {
+    const el: E = {
+      children: [], className: "", style: {}, value: "", placeholder: "", id: "",
+      scrollHeight: 0, clientHeight: 0, scrollTop: 0, parentNode: null,
+      _text: "",
+    };
+    // real DOM: setting textContent/innerHTML replaces the children
+    for (const prop of ["textContent", "innerHTML"] as const) {
+      Object.defineProperty(el, prop, {
+        get: () => el._text,
+        set: (v: string) => { el._text = v; el.children.length = 0; },
+      });
+    }
+    el.classList = {
+      add: (c: string) => { const s = new Set(el.className.split(" ").filter(Boolean)); s.add(c); el.className = [...s].join(" "); },
+      remove: (c: string) => { el.className = el.className.split(" ").filter((x: string) => x && x !== c).join(" "); },
+      toggle: (c: string, f?: boolean) => { const has = el.className.split(" ").includes(c); if (f ?? !has) el.classList.add(c); else el.classList.remove(c); },
+      contains: (c: string) => el.className.split(" ").includes(c),
+    };
+    el.appendChild = (c: E) => { c.parentNode = el; el.children.push(c); return c; };
+    // real DOM: insertBefore on an existing child MOVES it
+    el.insertBefore = (c: E, ref: E | null) => {
+      if (c.parentNode) { const i = c.parentNode.children.indexOf(c); if (i >= 0) c.parentNode.children.splice(i, 1); }
+      c.parentNode = el;
+      const i = ref ? el.children.indexOf(ref) : -1;
+      if (i >= 0) el.children.splice(i, 0, c); else el.children.push(c);
+      return c;
+    };
+    el.remove = () => {
+      if (el.parentNode) { const i = el.parentNode.children.indexOf(el); if (i >= 0) el.parentNode.children.splice(i, 1); el.parentNode = null; }
+    };
+    el.querySelector = () => null; // no tool calls in this scenario
+    el.querySelectorAll = () => [];
+    el.addEventListener = (t: string, f: (...a: unknown[]) => void) => { (el.listeners ??= {} as Record<string, any>)[t] = f; };
+    el.setAttribute = () => {};
+    el.focus = () => {};
+    allEls.push(el);
+    return el;
+  };
+  const idOf = (i: string): E | null => allEls.find((e) => e.id === i) ?? null;
+  const doc = {
+    title: "",
+    hidden: true,
+    body: mkEl(),
+    getElementById: (i: string) => idOf(i),
+    createElement: () => mkEl(),
+    addEventListener: () => {},
+  };
+  for (const i of ["msgs", "input", "dot", "meta", "stop", "send", "logout", "notif", "attach", "attachfile", "attstrip"]) {
+    const e = mkEl(); e.id = i;
+  }
+  class FEvSource {
+    static inst: FEvSource | null = null;
+    listeners = new Map<string, (e: { data: string }) => void>();
+    constructor(_url: string) { FEvSource.inst = this; }
+    addEventListener(name: string, f: (e: { data: string }) => void) { this.listeners.set(name, f); }
+  }
+  const fetchCalls: string[] = [];
+  const fetchStub = (url: string, opts?: { body?: string }) => {
+    fetchCalls.push(String(url) + " " + (opts?.body ?? ""));
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  };
+
+  // --- run the real page script (Notification undefined -> the bell hides itself) ---
+  const script = (CHAT_PAGE.match(/<script>([\s\S]*?)<\/script>/) ?? [""])[1] ?? "";
+  const handles: any = new Function(
+    "document", "EventSource", "fetch", "Notification", "localStorage", "navigator", "window", "location",
+    script + "\nreturn { send: send, msgs: () => msgs, userQ: () => userQ, pendingEl: () => pendingEl };"
+  )(
+    doc, FEvSource, fetchStub, undefined,
+    { getItem: () => null, setItem: () => {} }, {}, {}, { reload(): void {}, href: "" }
+  );
+  check("client: page script runs under the DOM stub", !!FEvSource.inst);
+  if (!FEvSource.inst) return;
+
+  const fire = (name: string, data: unknown): void =>
+    FEvSource.inst!.listeners.get(name)?.({ data: JSON.stringify(data) });
+
+  fire("snapshot", {
+    entries: [{ type: "thinking_level_change", id: "e0", parentId: null, timestamp: "1", thinkingLevel: "off" }],
+    meta: { cwd: "/w", model: "p/m", sessionName: "sess", leafId: "e0", usage: null },
+  });
+
+  // the user sends from the web: the page's own sendText -> dashed optimistic
+  // bubble at the bottom + POST /input
+  idOf("input")!.value = "hello";
+  handles.send();
+  check("client: send() POSTs /input with the text", fetchCalls.some((f) => f.startsWith("/input") && f.includes("hello")));
+
+  // wire order for an idle send under pi 0.84.x's persist-after-emit contract:
+  //   status(busy) -> reply `update`s (streaming bubble lands ABOVE the still-
+  //   pending user bubble) -> user entry `append` (one event LATE) -> status+
+  //   meta at agent_settled -> final assistant `append` (the settled flush)
+  fire("status", { busy: true });
+  fire("update", { role: "assistant", content: [{ type: "text", text: "work" }] });
+  fire("update", { role: "assistant", content: [{ type: "text", text: "working..." }] });
+  fire("append", { entries: [{ type: "message", id: "mU", parentId: "e0", timestamp: "2", message: { role: "user", content: [{ type: "text", text: "hello" }] } }] });
+  fire("status", { busy: false });
+  fire("meta", { usage: null });
+  fire("append", { entries: [{ type: "message", id: "mA", parentId: "mU", timestamp: "3", message: { role: "assistant", content: [{ type: "text", text: "done" }] } }] });
+
+  const kids = handles.msgs().children as E[];
+  const idxUser = kids.findIndex((k) => k.className === "msg user");
+  const idxAsst = kids.findIndex((k) => k.className === "msg assistant md");
+  check("client: late user append ends up ABOVE its answer",
+    idxUser >= 0 && idxAsst === idxUser + 1);
+  check("client: pending style removed from the user bubble",
+    idxUser >= 0 && !kids[idxUser].className.includes("pendinguser"));
+  check("client: answer finalizes as markdown from the settled-time append",
+    idxAsst >= 0 && kids[idxAsst]._text === "<p>done</p>");
+  check("client: no pending bubbles left after the run",
+    handles.userQ().length === 0 && handles.pendingEl() === null);
+}
+
+await clientOrderingTest();
 
 console.log("\n" + passed + " passed, " + failed + " failed");
 if (failed > 0) process.exit(1);
