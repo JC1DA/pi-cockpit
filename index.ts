@@ -862,12 +862,21 @@ function renderEntry(en) {
       if (hit) {
         userQ.splice(i, 1);
         hit.el.classList.remove('pendinguser');
-        // pi 0.84.x persists a message only after its message_end handlers ran,
-        // so this entry's append reaches us AFTER the reply's streaming bubble
-        // was positioned above the still-pending bubble (tail() puts agent
-        // content before queued user bubbles). Move the bubble ahead of the
-        // streaming bubble to keep chat order: user, then its answer.
-        if (pendingEl) msgs.insertBefore(hit.el, pendingEl);
+        // pi 0.84.x persists a message only after its message_end handlers
+        // ran, so this append can land while the reply is still streaming OR
+        // after it already finalized — tail() puts agent content before the
+        // still-pending bubble either way. Re-anchor the bubble right after
+        // its marker (the last element that existed when it was sent): every
+        // element after the marker belongs to this message's turn and stays
+        // below it. Keeps chat order: user, then its answer.
+        var bm = hit.marker;
+        if (bm && bm.parentNode === msgs) {
+          var ref = bm.nextElementSibling;
+          if (ref !== hit.el) {
+            if (ref) msgs.insertBefore(hit.el, ref); else msgs.appendChild(hit.el);
+            autoScroll();
+          }
+        }
       } else {
         addMsg('user', esc(t) + imgThumbs(imgParts));
       }
@@ -1286,7 +1295,9 @@ function sendText(t, mode) {
   var imgs = attachments; attachments = []; renderAtt();
   if (t.charAt(0) === '/' && imgs.length) { imgs = []; alert('commands cannot carry images'); }
   var el = addMsg('user', esc(t) + imgThumbs(imgs), 'pendinguser');
-  userQ.push({ el: el, text: t, images: imgs });
+  // marker: last chat element existing before this bubble; on the entry's
+  // append the bubble is re-anchored right after it (see renderEntry)
+  userQ.push({ el: el, text: t, images: imgs, marker: el.previousElementSibling });
   fetch('/input', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

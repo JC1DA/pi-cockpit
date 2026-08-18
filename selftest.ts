@@ -1034,7 +1034,18 @@ async function clientOrderingTest(): Promise<void> {
       toggle: (c: string, f?: boolean) => { const has = el.className.split(" ").includes(c); if (f ?? !has) el.classList.add(c); else el.classList.remove(c); },
       contains: (c: string) => el.className.split(" ").includes(c),
     };
-    el.appendChild = (c: E) => { c.parentNode = el; el.children.push(c); return c; };
+    // real DOM: appendChild of an existing child MOVES it
+    el.appendChild = (c: E) => {
+      if (c.parentNode) { const i = c.parentNode.children.indexOf(c); if (i >= 0) c.parentNode.children.splice(i, 1); }
+      c.parentNode = el; el.children.push(c); return c;
+    };
+    // sibling accessors the page's bubble re-anchoring reads
+    Object.defineProperty(el, "nextElementSibling", {
+      get: () => { const p = el.parentNode; if (!p) return null; const i = p.children.indexOf(el); return i >= 0 && i + 1 < p.children.length ? p.children[i + 1] : null; },
+    });
+    Object.defineProperty(el, "previousElementSibling", {
+      get: () => { const p = el.parentNode; if (!p) return null; const i = p.children.indexOf(el); return i > 0 ? p.children[i - 1] : null; },
+    });
     // real DOM: insertBefore on an existing child MOVES it
     el.insertBefore = (c: E, ref: E | null) => {
       if (c.parentNode) { const i = c.parentNode.children.indexOf(c); if (i >= 0) c.parentNode.children.splice(i, 1); }
@@ -1148,6 +1159,27 @@ async function clientOrderingTest(): Promise<void> {
     idxA2 >= 0 && (kids2[idxA2]._text as string).startsWith('<details class="thinkbox">') && (kids2[idxA2]._text as string).includes("full reasoning here"));
   check("client: no pending bubbles left after the thinking run",
     handles.pendingEl() === null);
+
+  // --- steer while streaming (the reported bug): the user entry's append can
+  // land only AFTER the reply already finalized above the still-pending
+  // bubble — the bubble must be re-anchored above its own answer ---
+  fire("status", { busy: true });
+  fire("update", { role: "assistant", content: [{ type: "text", text: "long in-flight answer" }] });
+  idOf("input")!.value = "steer question";
+  handles.send();
+  fire("append", { entries: [{ type: "message", id: "mS1", parentId: "mA2", timestamp: "10", message: { role: "assistant", content: [{ type: "text", text: "long in-flight answer (truncated)" }] } }] }); // interrupted reply settles in place
+  fire("update", { role: "assistant", content: [{ type: "text", text: "answer to steer" }] }); // the steer's reply streams while the bubble is still pending
+  fire("append", { entries: [{ type: "message", id: "mS2", parentId: "mS1", timestamp: "11", message: { role: "assistant", content: [{ type: "text", text: "answer to steer (truncated)" }] } }] }); // it finalizes ABOVE the bubble; pendingEl is now null
+  fire("append", { entries: [{ type: "message", id: "mU4", parentId: "mS2", timestamp: "12", message: { role: "user", content: [{ type: "text", text: "steer question" }] } }] }); // the user entry arrives last
+  fire("status", { busy: false });
+  const kids3 = handles.msgs().children as E[];
+  const iS1 = kids3.findIndex((k) => (k._text as string).includes("in-flight answer (truncated)"));
+  const iU4 = kids3.findIndex((k) => k.className === "msg user" && (k._text as string).includes("steer question"));
+  const iS2 = kids3.findIndex((k) => (k._text as string).includes("answer to steer (truncated)"));
+  check("client: steer bubble re-anchored between the old reply and its own answer",
+    iS1 >= 0 && iU4 === iS1 + 1 && iS2 === iU4 + 1);
+  check("client: steer bubble loses the pending style",
+    iU4 >= 0 && !kids3[iU4].className.includes("pendinguser"));
 
   // --- tool output filter: default all; a change flips the body class the CSS keys on ---
   check("client: tool filter defaults to all", doc.body.className.indexOf("ft-all") >= 0);

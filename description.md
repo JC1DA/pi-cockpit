@@ -52,8 +52,11 @@ above the answer.
   command path in both cases.
   pi 0.84.x persists each message only after its `message_end` handlers ran,
   so the web client sees the reply start streaming before the user entry is
-  persisted; the view re-positions the optimistic user bubble to its
-  chronological spot (above its answer) when the entry arrives, and the
+  persisted — and for a steer the entry can even land after the reply has
+  already finalized (the common case with a long first reply). The view
+  records a marker (the last chat element present when the bubble was sent)
+  and re-anchors the optimistic user bubble right after it when the entry
+  arrives, so the bubble sits above its own answer either way, and the
   run's trailing entry is flushed at `agent_settled`, so the final answer
   finalizes as markdown immediately instead of waiting for the next
   interaction.
