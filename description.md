@@ -6,11 +6,12 @@ Browse and drive the current pi session from a web browser.
 Starts a password-protected web server that streams the current pi session
 (user/assistant messages, tool calls, tool results, model changes, compaction
 markers) to a browser via Server-Sent Events, so you can watch the agent work
-from another machine on your LAN and type messages back into the agent.
-Assistant text renders as markdown (headings, lists, quotes, code, links,
-fenced code blocks with a copy button); user messages stay literal. When the
-model thinks, the reasoning streams dimmed and folds into a collapsed block
-above the answer.
+from another machine on your LAN and type messages back into the agent. The
+web message box also runs `! <command>` / `!! <command>` on the pi host, like
+the terminal's bash mode. Assistant text renders as markdown (headings,
+lists, quotes, code, links, fenced code blocks with a copy button); user
+messages stay literal. When the model thinks, the reasoning streams dimmed
+and folds into a collapsed block above the answer.
 
 ## Commands
 - `/webserve start [port]` — asks for a password (min 4 chars), starts the server
@@ -69,6 +70,27 @@ above the answer.
   file as base64 and count against the context until compaction. `/input` is
   the only route with a body cap above the spec's 100 KB (12 MB, to carry
   the images); other routes keep the 100 KB limit.
+- **`! <command>` / `!! <command>` in the web message box** — the web
+  equivalent of the terminal's `!` / `!!`: the command runs on the pi host
+  in the session's working directory, in the user's shell (settings
+  `shellPath` and `shellCommandPrefix`, exactly like the terminal), with pi's
+  own bash machinery (same spawn/env/process-tree handling as the agent's
+  bash tool). Output streams live into the view (up to 200 KB shown), and
+  on completion a `bashExecution` entry is recorded in the session file in
+  pi's own format (tail-truncated at 50 KB / 2000 lines, overflow captured
+  to a temp file). A single `!` makes the output visible to the agent from
+  the next LLM request on (via pi's `context` hook; `!!` stays invisible,
+  same as the terminal), and the entry persists across restarts and shows
+  to other web clients. Bare `!` (no command) is sent as a normal message,
+  matching the terminal. One bash command at a time: a second one while a
+  command runs is rejected with a note (the terminal has the same rule). The
+  web has no Esc, so a hung command is killed after 10 minutes and recorded
+  as cancelled. Terminal `!` / `!!` behavior is unchanged. This is the one
+  feature that imports `@earendil-works/pi-coding-agent` at runtime (for the
+  bash machinery); like the rest of the extension it targets pi 0.84.x. Known
+  v1 limitation: a web `!` running while a terminal resync happens is not
+  shown as a live card in the terminal (its entry lands there on the next
+  sync).
 - The web input box also accepts commands: `/new` starts a new session,
   `/compact [instructions]` compacts the context, `/model [provider/model-id]`
   switches the model, and `/tree [entry-id]` jumps to a previous point in the
@@ -120,11 +142,13 @@ above the answer.
 
 ## Tests
 - `npm install` (dev-only type deps), then:
-  - `node selftest.ts` — 160 unit + HTTP-protocol checks (password,
+  - `node selftest.ts` — 207 unit + HTTP-protocol checks (password,
     tokens/cookie, sanitizer, leaf diff, page syntax + usage/meta formatting,
     tab-title ⏳ prefix, finish-notification decision matrix, image upload:
     /input size caps + MIME/count validation, page attach UI, thinking stream
-    + collapsed finalize, full server
+    + collapsed finalize, web ! bash: parser, output cleaning, tail
+    truncation + full-output temp file, real-shell runs, SSE streaming,
+    session recording, agent-context injection, one-at-a-time, full server
     against a fake pi api, ask bridge: envelope wording, TUI component,
     HTTP ask flow, tool_call hook wiring — first-answer-wins, decline,
     duplicate 409, client-left fallback, agent_settled trailing-entry flush,
@@ -133,7 +157,9 @@ above the answer.
   - `npx tsc -p tsconfig.json` — strict type check.
 - Manual e2e checklist: `pi -e ./index.ts` → `/webserve start` → login in a
   browser → watch live streaming → send a message from the web (appears in the
-  TUI) → attach an image (📎, paste, or drag & drop) and send it (thumbnail
+  TUI) → `! ls` and `!! env` from the web (output streams live into the view;
+  `! ls` output is in the agent's next context, `!! env` is not) →
+  attach an image (📎, paste, or drag & drop) and send it (thumbnail
   shows in the view; the model sees it if vision-capable) → with a
   reasoning model at thinking level ≥ low, watch the dimmed thinking stream
   and the collapsed 💭 block on the finalized answer → `/compact` and

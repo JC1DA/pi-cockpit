@@ -4,19 +4,33 @@
  *   /webserve start [port]   (default 8765) — asks for a password, serves the session
  *   /webserve stop
  *   /webserve status
+ *   `! <cmd>` / `!! <cmd>` in the web message box — runs the command on the pi
+ *   host, like `!` / `!!` in the terminal
  *
- * Zero external runtime dependencies: node:http + node:crypto + node:os + node:fs,
- * plus pi's own bundled @earendil-works/pi-tui (matchesKey/visibleWidth) for the
- * terminal-side questionnaire of the ask bridge. The pi-coding-agent import is
- * type-only (erased at runtime).
+ * Zero external runtime dependencies: node:http + node:crypto + node:os +
+ * node:fs + node:path, plus pi's own bundled packages, which the extension
+ * loader aliases to pi's own copies: @earendil-works/pi-tui (matchesKey/
+ * visibleWidth for the ask bridge's terminal questionnaire) and
+ * @earendil-works/pi-coding-agent (bash execution + settings for web `!`).
  */
-import type { ContextUsage, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  createLocalBashOperations,
+  DEFAULT_MAX_BYTES,
+  SettingsManager,
+  truncateTail,
+  type ContextEvent,
+  type ContextUsage,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 import http from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { networkInterfaces } from "node:os";
-import { closeSync, openSync, readSync } from "node:fs";
+import { networkInterfaces, tmpdir } from "node:os";
+import { closeSync, createWriteStream, openSync, readSync } from "node:fs";
+import { join } from "node:path";
 
 export type AnyRec = Record<string, unknown>;
 
@@ -157,6 +171,165 @@ export function entryPreview(e: AnyRec): string {
   if (typeof c === "string") t = c;
   else if (Array.isArray(c)) t = c.map((b) => (b && typeof (b as AnyRec).text === "string" ? (b as AnyRec).text : "")).join(" ");
   return t.replace(/\s+/g, " ").trim().slice(0, 120);
+}
+
+// ---------------------------------------------------------------------------
+// Web `!` bash — the web equivalent of the TUI's `! cmd` / `!! cmd`: runs the
+// command on the pi host in the session cwd with the user's shell, streams
+// the output to the web, records a `bashExecution` session entry, and (single
+// `!` only) makes the output visible to the agent via the `context` hook in
+// the wiring section below. Terminal `!` is untouched (pi's own input handler
+// runs it before prompt()).
+// ---------------------------------------------------------------------------
+
+/** Parse `! cmd` / `!! cmd` web input, TUI-style: `!!` excludes the output
+ *  from LLM context. Null when the text is not a bash line; an empty command
+ *  (bare `!` / `!!`) is not a bash line either (caller sends it as a message). */
+export function parseBashLine(text: string): { command: string; exclude: boolean } | null {
+  if (!text.startsWith("!")) return null;
+  const exclude = text.startsWith("!!");
+  return { command: (exclude ? text.slice(2) : text.slice(1)).trim(), exclude };
+}
+
+// ANSI escape stripper — pi's own pattern (dist/utils/ansi.js, MIT, derived
+// from chalk/ansi-regex): OSC sequences, then CSI with params/intermediates.
+const BASH_ANSI_RE =
+  /(?:\u001B\][\s\S]*?(?:\u0007|\u001B\\|\u009C))|[\u001B\u009B][[\]()#;?]*(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]/g;
+
+/** Clean one decoded output chunk exactly like pi's executeBashWithOperations:
+ *  strip ANSI, drop control chars (keep tab/newline), drop Unicode format
+ *  chars, drop CR. */
+export function cleanBashText(s: string): string {
+  if (s.includes("\u001B") || s.includes("\u009B")) s = s.replace(BASH_ANSI_RE, "");
+  return Array.from(s)
+    .filter((ch) => {
+      const c = ch.codePointAt(0);
+      if (c === undefined) return false;
+      if (c === 0x09 || c === 0x0a || c === 0x0d) return true;
+      if (c <= 0x1f) return false;
+      if (c >= 0xfff9 && c <= 0xfffb) return false;
+      return true;
+    })
+    .join("")
+    .replace(/\r/g, "");
+}
+
+/** Stop streaming output to the browser once this much has been shown; the
+ *  finalized session entry carries the official tail-truncated output. */
+export const BASHOUT_STREAM_LIMIT = 200_000;
+/** The web has no Esc to cancel bash (the TUI's `!` is unbounded + Esc), so
+ *  bound it: killed after 10 minutes and recorded as cancelled. */
+export const BASH_TIMEOUT_MS = 10 * 60 * 1000;
+
+export interface WebBashResult {
+  output: string;
+  exitCode: number | undefined;
+  cancelled: boolean;
+  truncated: boolean;
+  fullOutputPath?: string;
+}
+
+/**
+ * Run one bash line the way pi's TUI does: the user's shell (settings
+ * `shellPath`, `shellCommandPrefix` prepended), the session cwd, pi's own
+ * local BashOperations (same spawn/env/process-tree handling as the agent's
+ * bash tool), output streamed through cleanBashText, tail-truncated at pi's
+ * own 50KB/2000-line limits, overflow captured to a temp file. Resolves for
+ * normal completion and timeout (cancelled); throws only on spawn-level
+ * errors (bad cwd, no shell found) so the caller can report them.
+ */
+export async function runWebBash(
+  command: string,
+  cwd: string,
+  shellPath: string | undefined,
+  commandPrefix: string | undefined,
+  onChunk: (text: string) => void,
+): Promise<WebBashResult> {
+  const ops = createLocalBashOperations({ shellPath });
+  const full = commandPrefix ? commandPrefix + "\n" + command : command;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), BASH_TIMEOUT_MS);
+  const chunks: string[] = [];
+  let kept = 0;
+  let total = 0;
+  let tmpPath: string | undefined;
+  let tmpStream: ReturnType<typeof createWriteStream> | undefined;
+  const ensureTmp = (): void => {
+    if (!tmpPath) {
+      tmpPath = join(tmpdir(), "pi-bash-" + randomBytes(8).toString("hex") + ".log");
+      tmpStream = createWriteStream(tmpPath);
+      for (const c of chunks) tmpStream.write(c);
+    }
+  };
+  const decoder = new TextDecoder();
+  const onData = (data: Buffer): void => {
+    total += data.length;
+    const text = cleanBashText(decoder.decode(data, { stream: true }));
+    if (total > DEFAULT_MAX_BYTES) ensureTmp();
+    tmpStream?.write(text);
+    chunks.push(text);
+    kept += text.length;
+    while (kept > 2 * DEFAULT_MAX_BYTES && chunks.length > 1) kept -= chunks.shift()!.length;
+    if (text) onChunk(text);
+  };
+  const finish = async (cancelled: boolean, exitCode: number | null): Promise<WebBashResult> => {
+    const fullOutput = chunks.join("");
+    const tr = truncateTail(fullOutput);
+    if (tr.truncated && !tmpPath) ensureTmp();
+    if (tmpStream) {
+      // await the flush so fullOutputPath is complete when this resolves (the
+      // session entry references the file; readers must not see a partial one).
+      const s = tmpStream; // local: keeps the narrowing inside the callbacks
+      await new Promise<void>((res) => { s.once("close", () => res()); s.once("error", () => res()); s.end(); });
+    }
+    return {
+      output: tr.truncated ? tr.content : fullOutput,
+      exitCode: cancelled ? undefined : exitCode ?? undefined,
+      cancelled,
+      truncated: tr.truncated,
+      fullOutputPath: tmpPath,
+    };
+  };
+  try {
+    const r = await ops.exec(full, cwd, { onData, signal: ac.signal });
+    return await finish(false, r.exitCode);
+  } catch (err) {
+    if (ac.signal.aborted) return await finish(true, null);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Bash messages in the session's context entry list (compaction-aware) that
+ *  the agent's in-memory message list is missing — i.e. web `!` results the
+ *  agent hasn't seen yet. Matched by command+timestamp (terminal `!` results
+ *  live in both places and so never re-inject); `!!` entries never qualify. */
+export function missingBashMessages(contextEntries: AnyRec[], liveMessages: AnyRec[]): AnyRec[] {
+  const key = (m: AnyRec): string => m.command + "\u0000" + m.timestamp;
+  const present = new Set(liveMessages.filter((m) => m.role === "bashExecution").map(key));
+  const out: AnyRec[] = [];
+  for (const e of contextEntries) {
+    const m = e.type === "message" ? (e.message as AnyRec | undefined) : undefined;
+    if (m?.role !== "bashExecution" || m.excludeFromContext) continue;
+    if (!present.has(key(m))) out.push(m);
+  }
+  return out;
+}
+
+/** Merge missing bash messages into the live list in timestamp order (what
+ *  the context hook returns as the transformed message set). */
+export function mergeBashMessages(liveMessages: AnyRec[], extra: AnyRec[]): AnyRec[] {
+  if (extra.length === 0) return liveMessages;
+  const sorted = [...extra].sort((a, b) => ((a.timestamp as number) ?? 0) - ((b.timestamp as number) ?? 0));
+  const out: AnyRec[] = [];
+  let i = 0;
+  for (const m of liveMessages) {
+    while (i < sorted.length && ((sorted[i].timestamp as number) ?? 0) <= ((m.timestamp as number) ?? 0)) out.push(sorted[i++]);
+    out.push(m);
+  }
+  while (i < sorted.length) out.push(sorted[i++]);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -849,6 +1022,11 @@ function toolEl(id, name, state) {
   s.textContent = name + ' — ' + state;
   return el;
 }
+function bashStateOf(m) {
+  if (m.cancelled) return 'cancelled';
+  if (typeof m.exitCode === 'number') return m.exitCode === 0 ? 'done' : 'error (exit ' + m.exitCode + ')';
+  return 'killed';
+}
 function renderEntry(en) {
   if (en.type === 'message' && en.message) {
     var m = en.message;
@@ -933,13 +1111,31 @@ function renderEntry(en) {
       }
       autoScroll();
     } else if (m.role === 'bashExecution') {
-      var el4 = document.createElement('details');
-      el4.className = 'tool';
-      el4.innerHTML = '<summary>! ' + esc(m.command || '') + '</summary>';
-      var pre4 = document.createElement('pre');
+      // Web ! bash: a live card (bashstart) exists while the command runs —
+      // reuse it so the recorded entry doesn't render a duplicate card. No
+      // live card (resync / late entry) renders a fresh one.      var live = null;
+      var liveEls = document.querySelectorAll('details.tool[data-bashlive]');
+      for (var li = 0; li < liveEls.length; li++) {
+        if (liveEls[li].getAttribute('data-bashcmd') === (m.command || '')) { live = liveEls[li]; break; }
+      }
+      var el4 = live;
+      if (!el4) {
+        el4 = document.createElement('details');
+        el4.className = 'tool';
+        el4.innerHTML = '<summary>! ' + esc(m.command || '') + ' — ' + esc(bashStateOf(m)) + '</summary>';
+        tail(el4);
+      } else {
+        el4.removeAttribute('data-bashlive');
+      }
+      var pre4 = el4.querySelector('pre.out');
+      if (!pre4) {
+        pre4 = document.createElement('pre');
+        pre4.className = 'out';
+        el4.appendChild(pre4);
+      }
       pre4.textContent = m.output || '';
-      el4.appendChild(pre4);
-      tail(el4);
+      el4.classList.toggle('err', !!m.cancelled || (typeof m.exitCode === 'number' && m.exitCode !== 0));
+      autoScroll();
     } else if (m.role === 'custom' || m.role === 'customMessage') {
       addNote('note: ' + textOf(m.content).slice(0, 200));
     }
@@ -993,6 +1189,37 @@ es.addEventListener('append', function (e) {
 es.addEventListener('toolstart', function (e) {
   var d = JSON.parse(e.data);
   toolEl(d.id, d.name, 'running...');
+});
+// Web ! bash: live card while the command runs. The card keeps its
+// data-bashlive mark after bashend so the arriving session entry (append) can
+// find and reuse it instead of rendering a duplicate.
+es.addEventListener('bashstart', function (e) {
+  var d = JSON.parse(e.data);
+  var el = document.createElement('details');
+  el.className = 'tool';
+  el.setAttribute('data-bashlive', '1');
+  el.setAttribute('data-bashcmd', d.command || '');
+  el.innerHTML = '<summary>! ' + esc(d.command || '') + ' — running…</summary>';
+  tail(el);
+  autoScroll();
+});
+es.addEventListener('bashout', function (e) {
+  var d = JSON.parse(e.data);
+  var el = document.querySelector('details.tool[data-bashlive]');
+  if (!el) return;
+  var pre = el.querySelector('pre.out');
+  if (!pre) { pre = document.createElement('pre'); pre.className = 'out'; el.appendChild(pre); }
+  if (pre.textContent.length < 200000) pre.textContent += d.delta || '';
+  autoScroll();
+});
+es.addEventListener('bashend', function (e) {
+  var d = JSON.parse(e.data);
+  var el = document.querySelector('details.tool[data-bashlive]');
+  if (!el) return;
+  var s = el.querySelector('summary');
+  var state = d.error ? 'failed: ' + (d.text || '') : d.cancelled ? 'cancelled' : (typeof d.exitCode === 'number') ? (d.exitCode === 0 ? 'done' : 'error (exit ' + d.exitCode + ')') : 'killed';
+  if (s) s.textContent = '! ' + (el.getAttribute('data-bashcmd') || '') + ' — ' + state;
+  el.classList.toggle('err', !!d.error || !!d.cancelled || (typeof d.exitCode === 'number' && d.exitCode !== 0));
 });
 es.addEventListener('status', function (e) { setBusy(!!JSON.parse(e.data).busy); });
 es.addEventListener('meta', function (e) {
@@ -1805,6 +2032,12 @@ let tokens = new Set<string>();
 let passwordHash = "";
 let curCtx: ExtensionContext | null = null;
 let curPi: ExtensionAPI | null = null;
+// Settings source for web `!` (one SettingsManager per command). The selftest
+// swaps this for an in-memory instance so tests never read the user's real
+// settings.
+export const bashSettingsRef: { factory: (cwd: string) => SettingsManager } = {
+  factory: (cwd) => SettingsManager.create(cwd),
+};
 
 const stopServer = (): void => {
   if (!server) return;
@@ -1844,6 +2077,18 @@ export default function (pi: ExtensionAPI): void {
       return m;
     },
     async sendInput(text, mode: "steer" | "followUp" = "steer", images: ImageInput[] = []) {
+      // Web `!`/`!!`: host bash, never a user message. A bang with images
+      // falls through as a normal message, matching the terminal (a bang
+      // means bash only as a plain-text line).
+      if (images.length === 0) {
+        const bash = parseBashLine(text);
+        if (bash && bash.command) {
+          void webBash(bash.command, bash.exclude).catch((err) =>
+            server?.broadcast("note", { text: "bash: " + (err as Error).message }),
+          );
+          return { queued: false };
+        }
+      }
       const ctx = curCtx;
       const p = curPi;
       if (!ctx || !p) throw noCtxError();
@@ -1870,6 +2115,75 @@ export default function (pi: ExtensionAPI): void {
 
   const leaf = (): string | null => (curCtx ? curCtx.sessionManager.getLeafId() : null);
   const changed = (): void => { server?.onSessionChanged(leaf()); };
+
+  // --- web `!` bash: run in the background, stream to the web, record on completion ---
+  let bashSeq = 0;
+  let bashRunning = false;
+
+  const webBash = async (command: string, exclude: boolean): Promise<void> => {
+    const ctx = curCtx;
+    if (!ctx) {
+      server?.broadcast("note", { text: "bash: session is ending" });
+      return;
+    }
+    if (bashRunning) {
+      // parity with the TUI's "A bash command is already running. Press Esc to
+      // cancel it first" — the web has no Esc, so the second command waits.
+      server?.broadcast("note", { text: "bash already running — wait for it to finish" });
+      return;
+    }
+    bashRunning = true;
+    const id = String(++bashSeq);
+    const sm = ctx.sessionManager;
+    server?.broadcast("bashstart", { id, command });
+    let shown = 0;
+    let res: WebBashResult;
+    try {
+      // ponytail: fresh SettingsManager per command (two small JSON reads); cache it if bash gets frequent.
+      const settings = bashSettingsRef.factory(ctx.cwd);
+      res = await runWebBash(
+        command,
+        ctx.cwd,
+        settings.getShellPath(),
+        settings.getShellCommandPrefix(),
+        (text) => {
+          shown += text.length;
+          if (shown <= BASHOUT_STREAM_LIMIT) server?.broadcast("bashout", { id, delta: text });
+        },
+      );
+    } catch (err) {
+      // spawn-level failure (bad cwd, no shell found) — no session entry, just report.
+      server?.broadcast("bashend", { id, error: true, text: (err as Error).message });
+      bashRunning = false;
+      return;
+    }
+    // The session may have been replaced (/new, /fork, /resume) while the
+    // command ran: the captured manager is stale — don't pollute the new
+    // session's file with a result the user ran against the old one. The web
+    // already streamed and showed the output.
+    if (curCtx?.sessionManager === sm) {
+      // deviation: the ctx type only exposes the read-only session manager;
+      // at runtime it is the full SessionManager, and web `!` needs
+      // appendMessage (the equivalent of pi's recordBashResult, which is
+      // AgentSession-only). The BashExecutionMessage shape is pi's own
+      // (dist/core/types.ts) — no exported name to import, so the cast is
+      // structural.
+      (sm as unknown as SessionManager).appendMessage({
+        role: "bashExecution",
+        command,
+        output: res.output,
+        exitCode: res.exitCode, // type: number | undefined (absent when killed); convertToLlm treats absent and null the same
+        cancelled: res.cancelled,
+        truncated: res.truncated,
+        fullOutputPath: res.fullOutputPath,
+        timestamp: Date.now(),
+        excludeFromContext: exclude,
+      });
+      changed();
+    }
+    server?.broadcast("bashend", { id, exitCode: res.exitCode, cancelled: res.cancelled, truncated: res.truncated });
+    bashRunning = false;
+  };
 
   // --- session lifecycle ---
   pi.on("session_start", (_e, ctx) => { curCtx = ctx; server?.resyncAll(); });
@@ -1928,6 +2242,24 @@ export default function (pi: ExtensionAPI): void {
     // now, so flush it and let the final message finalize as markdown without
     // waiting for the next interaction.
     changed();
+  });
+
+  // --- web `!` visibility ---
+  // Extensions can't push into the agent's in-memory state (recordBashResult
+  // is AgentSession-only), so on every provider request we inject the
+  // session's bashExecution entries the live message list is missing — web `!`
+  // results the agent hasn't seen yet. Terminal `!` results are already in
+  // state (matched by command+timestamp) and never double up; `!!` results
+  // stay invisible; compaction drops still apply, because the source list is
+  // the compaction-aware buildContextEntries(), exactly what the TUI does.
+  pi.on("context", (e, ctx) => {
+    const missing = missingBashMessages(
+      ctx.sessionManager.buildContextEntries() as unknown as AnyRec[],
+      e.messages as unknown as AnyRec[],
+    );
+    if (missing.length === 0) return;
+    const merged = mergeBashMessages(e.messages as unknown as AnyRec[], missing);
+    return { messages: merged as unknown as ContextEvent["messages"] };
   });
 
   // --- ask_user_question bridge: web + terminal, first answer wins ---

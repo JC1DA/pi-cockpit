@@ -2,8 +2,9 @@
 
 Stream your pi session to a web browser. Watch the agent work from another
 machine on your LAN, type messages back into it, stop the run, and answer the
-agent's questions. One file; the only non-node: import is pi's own bundled
-`pi-tui` (for the terminal-side question dialog).
+agent's questions. One file; the only non-node: imports are pi's own bundled packages: `pi-tui`
+(for the terminal-side question dialog) and `pi-coding-agent` (web `!` bash
+execution and shell settings).
 
 ## Install
 
@@ -45,6 +46,13 @@ in a browser, enter the password, and the session streams live:
   answers, even though pi persists them a beat after the reply starts
   streaming, and the final answer renders as markdown the moment the run
   settles.
+- **`! <command>` / `!! <command>`** — runs the command on the pi host (the
+  machine running pi) in the session's working directory, with the same
+  shell as the terminal's `!`. Output streams live into the view and is
+  recorded in the session like terminal `!` output: with a single `!` the
+  agent sees the output from the next turn on, with `!!` it stays hidden
+  from the agent. The web has no Esc, so a command that hangs is killed
+  after 10 minutes (recorded as cancelled); one command at a time.
 - **Attach images** — the 📎 button, paste, or drag & drop onto the input
   (png, jpeg, webp, gif; up to 3 per message, 4 MB each). Images ride with
   the next message for vision-capable models and show as thumbnails in the
@@ -89,12 +97,15 @@ gets its own server (8765, 8766, ...).
 
 ```bash
 npm install               # dev-only type deps
-node selftest.ts          # 156 checks: password, tokens, sanitizer, leaf diff,
-                          # input dispatch, page JS (incl. usage/meta formatting, tab-title
-                          # prefix, finish notifications, markdown rendering), HTTP protocol,
-                          # live SSE, pi wiring (factory re-run across session replacement,
-                          # usage refresh, /resume cwd policy), ask bridge (envelope wording,
-                          # TUI component, HTTP ask flow, first-answer-wins hook wiring)
+node selftest.ts          # 207 checks: password, tokens, sanitizer, leaf diff,
+                          # input dispatch, web ! bash (parser, output cleaning, truncation +
+                          # full-output file, real-shell runs, SSE streaming, session
+                          # recording, agent-context injection, one-at-a-time), page JS (incl.
+                          # usage/meta formatting, tab-title prefix, finish notifications,
+                          # markdown rendering), HTTP protocol, live SSE, pi wiring (factory
+                          # re-run across session replacement, usage refresh, /resume cwd
+                          # policy), ask bridge (envelope wording, TUI component, HTTP ask
+                          # flow, first-answer-wins hook wiring)
 npx tsc -p tsconfig.json  # strict type check
 ```
 

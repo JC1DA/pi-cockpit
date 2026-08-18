@@ -3,7 +3,8 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { hashPassword, verifyPassword, issueToken, cookieHeader, clearCookieHeader, tokenFromCookie, sanitizeEntry, diffLeaf, inputOpts, startServer, default as piCockpit, type AnyRec, type ImageInput, LOGIN_PAGE, CHAT_PAGE, buildAskEnvelope, extractAskQuestions, AskTuiComponent, ASK_RESERVED_LABELS, type AskQuestion, type AskOutcome } from "./index.ts";
+import { SettingsManager } from "@earendil-works/pi-coding-agent";
+import { hashPassword, verifyPassword, issueToken, cookieHeader, clearCookieHeader, tokenFromCookie, sanitizeEntry, diffLeaf, inputOpts, startServer, default as piCockpit, type AnyRec, type ImageInput, LOGIN_PAGE, CHAT_PAGE, buildAskEnvelope, extractAskQuestions, AskTuiComponent, ASK_RESERVED_LABELS, type AskQuestion, type AskOutcome, parseBashLine, cleanBashText, missingBashMessages, mergeBashMessages, runWebBash, bashSettingsRef, BASHOUT_STREAM_LIMIT, BASH_TIMEOUT_MS } from "./index.ts";
 
 let failed = 0, passed = 0;
 function check(name: string, cond: boolean): void {
@@ -435,6 +436,69 @@ check("inputOpts: busy chat input can queue as followUp via the /input mode",
 check("inputOpts: busy slash input keeps the command path (followUp); idle delivers directly",
   inputOpts("/new", false).deliverAs === "followUp" && inputOpts("/new", true).deliverAs === undefined && inputOpts("hello", true).deliverAs === undefined);
 
+// ---------- web ! bash: pure helpers ----------
+{
+  check("bash parse: ! cmd parses, context included",
+    JSON.stringify(parseBashLine("! git status")) === '{"command":"git status","exclude":false}');
+  check("bash parse: !! parses as excluded",
+    parseBashLine("!! ls")!.exclude === true && parseBashLine("!! ls")!.command === "ls");
+  check("bash parse: !!! is excluded with command ! ls (TUI parity)",
+    parseBashLine("!!! ls")!.exclude === true && parseBashLine("!!! ls")!.command === "! ls");
+  check("bash parse: bare ! / !! have empty command (sent as message)",
+    parseBashLine("!")!.command === "" && parseBashLine("!!")!.command === "");
+  check("bash parse: bang with leading spaces trimmed",
+    parseBashLine("!   echo hi  ")!.command === "echo hi");
+  check("bash parse: no leading bang -> null", parseBashLine("x ! y") === null && parseBashLine("") === null);
+
+  check("bash clean: CSI color escapes stripped",
+    cleanBashText("\u001b[31mred\u001b[0m") === "red" && cleanBashText("\u001b[1;32mgreen\u001b[39m") === "green");
+  check("bash clean: OSC sequences stripped", cleanBashText("\u001b]0;title\u0007body") === "body");
+  check("bash clean: C0 controls dropped, tab/newline kept, CR dropped",
+    cleanBashText("a\u0000b\u0001c\td\ne\r") === "abc\td\ne");
+  check("bash clean: unicode format chars dropped", cleanBashText("a\uFFFAb\uFFFBc") === "abc");
+  check("bash clean: plain text untouched", cleanBashText("plain 123\nline2") === "plain 123\nline2");
+
+  const b1 = { role: "bashExecution", command: "git status", output: "clean", exitCode: 0, cancelled: false, truncated: false, timestamp: 100 } as AnyRec;
+  const b2 = { role: "bashExecution", command: "ls", output: "x", exitCode: 0, cancelled: false, truncated: false, timestamp: 300, excludeFromContext: true } as AnyRec;
+  const e1 = { type: "message", id: "ba", timestamp: "100", message: b1 } as AnyRec;
+  const e2 = { type: "message", id: "bb", timestamp: "300", message: b2 } as AnyRec;
+  const eC = { type: "compaction", id: "c1", timestamp: "90", summary: "s" } as AnyRec;
+  check("bash ctx: missing = session bash entries not in live state",
+    missingBashMessages([eC, e1, e2], []).length === 1 && missingBashMessages([eC, e1, e2], [])[0].command === "git status");
+  check("bash ctx: terminal ! (in both) never re-injects",
+    missingBashMessages([e1], [{ ...b1 }]).length === 0 && missingBashMessages([e1], [{ ...b1, output: "stale" }]).length === 0);
+  check("bash ctx: different timestamp of same command does re-inject",
+    missingBashMessages([e1], [{ ...b1, timestamp: 999 }]).length === 1);
+  const live = [{ role: "user", content: "q", timestamp: 200 } as AnyRec, { role: "assistant", content: "a", timestamp: 400 } as AnyRec];
+  const merged = mergeBashMessages(live, [{ ...b1, timestamp: 300 }]);
+  check("bash merge: inserts in timestamp order",
+    JSON.stringify(merged.map((m) => m.role)) === '["user","bashExecution","assistant"]');
+  check("bash merge: empty extra returns the live list unchanged",
+    mergeBashMessages(live, []) === live);
+
+  // runWebBash: real shell, real cwd — covers the stream/clean/truncate pipeline end to end.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cockpit-bt-"));
+  const out1 = await runWebBash("echo hi", dir, undefined, undefined, () => {});
+  check("bash run: runs in cwd with the default shell, exit 0, clean output",
+    out1.output === "hi\n" && out1.exitCode === 0 && out1.cancelled === false && out1.truncated === false && out1.fullOutputPath === undefined);
+  const out2 = await runWebBash("exit 3", dir, undefined, undefined, () => {});
+  check("bash run: non-zero exit captured, not cancelled", out2.exitCode === 3 && out2.cancelled === false);
+  const out3 = await runWebBash("printf '\u001b[31mcolored\u001b[0m' && echo", dir, undefined, undefined, () => {});
+  check("bash run: ANSI stripped from the captured output", out3.output === "colored\n");
+  // 60KB of output: exceeds the 50KB keep limit -> tail truncated + temp file.
+  const out4 = await runWebBash("head -c 61440 /dev/zero | tr '\\0' 'a' && echo", dir, undefined, undefined, () => {});
+  check("bash run: >50KB output is tail-truncated with a full-output file",
+    out4.truncated === true && out4.output.length <= 51200 && out4.output === "a".repeat(51200) &&
+      !!out4.fullOutputPath && fs.readFileSync(out4.fullOutputPath, "utf8").length >= 61440);
+  check("bash run: bad cwd throws (caller reports it, no cancelled flag)",
+    await (async () => { try { await runWebBash("echo hi", "/no/such/dir-xyz", undefined, undefined, () => {}); return false; } catch { return true; } })());
+  check("bash run: stream limit + timeout constants are sane",
+    BASHOUT_STREAM_LIMIT === 200000 && BASH_TIMEOUT_MS === 600000);
+  // shellCommandPrefix is prepended by pi's own ops path (TUI parity).
+  const out5 = await runWebBash("echo hi", dir, undefined, "echo pref", () => {});
+  check("bash run: shellCommandPrefix is prepended", out5.output.startsWith("pref\n") && out5.output.includes("hi"));
+}
+
 await httpTests();
 
 // ---------- SSE streaming ----------
@@ -644,12 +708,13 @@ async function wiringTests(): Promise<void> {
     lastComp: null | { handleInput(d: string): void; close?(): void };
     doneCalls: unknown[];
     tuiTypes: boolean;
+    tuiDelay: number;
   };
-  const makeCtx = (entries: Record<string, unknown>[], leafId: string | null) => {
+  const makeCtx = (entries: Record<string, unknown>[], leafId: string | null, cwd = "/w") => {
     let leaf = leafId;
     const navCalls: string[] = [];
     const usage: { tokens: number | null; contextWindow: number; percent: number | null } = { tokens: null, contextWindow: 200000, percent: null };
-    const ask: AskTestState = { lastComp: null, doneCalls: [], tuiTypes: false };
+    const ask: AskTestState = { lastComp: null, doneCalls: [], tuiTypes: false, tuiDelay: 50 };
     // Emulates pi's custom() plumbing: runs the factory, resolves the returned
     // promise when the component's done() fires. tuiTypes simulates the local
     // user picking option 2 +50ms later.
@@ -666,7 +731,7 @@ async function wiringTests(): Promise<void> {
         const done = (o: unknown) => { ask.doneCalls.push(o); resolveFn(o); };
         const comp = factory(fakeTui, {}, {}, done);
         ask.lastComp = comp;
-        if (ask.tuiTypes) setTimeout(() => { comp?.handleInput("\u001b[B"); comp?.handleInput("\r"); }, 50);
+        if (ask.tuiTypes) setTimeout(() => { comp?.handleInput("\u001b[B"); comp?.handleInput("\r"); }, ask.tuiDelay);
         return p;
       },
     };
@@ -680,9 +745,17 @@ async function wiringTests(): Promise<void> {
         sessionManager: {
           getEntries: () => entries,
           buildContextEntries: () => entries,
-          getCwd: () => "/w",
+          getCwd: () => cwd,
           getSessionName: () => null,
           getLeafId: () => leaf,
+          // Fake of the runtime SessionManager.appendMessage (message entries only,
+          // as used by the web ! bash recorder).
+          appendMessage: (message: Record<string, unknown>): string => {
+            const id = "b" + (entries.length + 1) + "x";
+            entries.push({ type: "message", id, parentId: leaf, timestamp: String(Date.now()), message });
+            leaf = id;
+            return id;
+          },
         },
         model: undefined as { provider: string; id: string } | undefined,
         modelRegistry: {
@@ -692,6 +765,7 @@ async function wiringTests(): Promise<void> {
         scopedModels: [],
         hasUI: true,
         mode: "tui",
+        cwd,
         signal: undefined,
         isIdle: () => true,
         abort(): void {},
@@ -866,6 +940,101 @@ async function wiringTests(): Promise<void> {
     if (fake2 && c2) { try { await fake2.commands.get("webserve")!.handler("stop", c2.ctx); } catch { /* already stopped */ } }
   }
 
+  // --- phase 1.5: web ! bash (host execution, streaming, recording, agent visibility) ---
+  const bashCwd = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-cockpit-bash-"));
+  bashSettingsRef.factory = () => SettingsManager.inMemory({}); // never read the user's real settings
+  const fakeb = makeFakePi();
+  piCockpit(fakeb.pi);
+  const cb = makeCtx([
+    { type: "message", id: "w1", parentId: null, timestamp: "1", message: { role: "user", content: "w" } },
+  ], "w1", bashCwd);
+  fakeb.emit("session_start", { type: "session_start", reason: "start" }, cb.ctx);
+  await fakeb.commands.get("webserve")!.handler("start 39414", cb.ctx);
+  const nb = cb.ui.notes.find((n) => n.includes("web viewer:")) ?? "";
+  const mb = nb.match(/localhost:(\d+)/);
+  check("bash wiring: server up for the web-bash phase", !!mb);
+  if (!mb) { check("bash wiring: abort, no server", false); return; }
+  const baseb = "http://127.0.0.1:" + mb[1];
+  const loginb = await fetch(baseb + "/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: "testpw123" }) });
+  const cookieb = (loginb.headers.get("set-cookie") ?? "").split(";")[0];
+  const sseb = await new Promise<{ get: () => string; close: () => void }>((resolve, reject) => {
+    const chunks: string[] = [];
+    const req = http.get(baseb + "/events", { headers: { cookie: cookieb } }, (res) => {
+      res.on("data", (c: Buffer) => chunks.push(c.toString()));
+      resolve({ get: () => chunks.join(""), close: () => req.destroy() });
+    });
+    req.on("error", reject);
+  });
+  const waitB = (needle: string, ms = 10000): Promise<void> =>
+    new Promise((resolve, reject) => {
+      const t0 = Date.now();
+      const t = setInterval(() => {
+        if (sseb.get().includes(needle)) { clearInterval(t); resolve(); }
+        else if (Date.now() - t0 > ms) { clearInterval(t); reject(new Error("timeout waiting for: " + needle)); }
+      }, 20);
+    });
+  const postB = (text: string): Promise<Response> =>
+    fetch(baseb + "/input", { method: "POST", headers: { "Content-Type": "application/json", cookie: cookieb }, body: JSON.stringify({ text }) });
+  try {
+    // (a) ! runs on the host, never reaches the agent, streams, and records
+    check("bash wiring: ! echo hi -> 200 and NOT sent to the agent",
+      (await postB("! echo hi")).status === 200 && !fakeb.sent.some((s) => s.text === "! echo hi"));
+    await waitB("event: bashstart");
+    check("bash wiring: bashstart carries the command", sseb.get().includes('"command":"echo hi"'));
+    await waitB("event: bashend");
+    check("bash wiring: output streams via bashout", sseb.get().includes("event: bashout") && sseb.get().includes("hi"));
+    await waitB('"role":"bashExecution"');
+    check("bash wiring: recorded entry reaches web clients, context included",
+      sseb.get().includes('"command":"echo hi"') && sseb.get().includes('"excludeFromContext":false'));
+    const rec = cb.ctx.sessionManager.buildContextEntries();
+    check("bash wiring: entry recorded via appendMessage with clean output",
+      rec.some((e) => e.type === "message" && (e.message as AnyRec).role === "bashExecution" &&
+        (e.message as AnyRec).command === "echo hi" && String((e.message as AnyRec).output).includes("hi") && (e.message as AnyRec).exitCode === 0));
+
+    // (b) !! records the same but with excludeFromContext
+    check("bash wiring: !! echo secret -> 200 and NOT sent to the agent",
+      (await postB("!! echo secret")).status === 200 && !fakeb.sent.some((s) => s.text === "!! echo secret"));
+    await waitB('"command":"echo secret"');
+    await waitB('"excludeFromContext":true');
+    check("bash wiring: !! entry is recorded with excludeFromContext",
+      sseb.get().includes('"command":"echo secret"') && sseb.get().includes('"excludeFromContext":true'));
+
+    // (c) one bash at a time: a second command while one runs is rejected (the web has no Esc)
+    check("bash wiring: ! sleep 0.5 accepted", (await postB("! sleep 0.5")).status === 200);
+    await waitB('"command":"sleep 0.5"');
+    check("bash wiring: second ! while one runs -> 200 (rejected, not queued)",
+      (await postB("! echo second")).status === 200);
+    await new Promise((r) => setTimeout(r, 800));
+    check("bash wiring: rejected command got a note and never ran",
+      sseb.get().includes("bash already running") && !sseb.get().includes('"command":"echo second"'));
+    const countBashEnd = (): number => sseb.get().split("event: bashend").length - 1;
+    const t0 = Date.now();
+    while (countBashEnd() < 3) { if (Date.now() - t0 > 10000) break; await new Promise((r) => setTimeout(r, 20)); }
+    check("bash wiring: the running bash finishes (three bashends so far)", countBashEnd() === 3);
+
+    // (d) context hook: injects the missing single-! results, never !!, and is a no-op once in state
+    const ctxH = (fakeb as unknown as { handlers: Map<string, Array<(e: unknown, ctx: unknown) => unknown>> }).handlers.get("context")?.[0];
+    check("bash wiring: context hook registered", !!ctxH);
+    if (ctxH) {
+      const live = [{ role: "user", content: "q", timestamp: 1 } as AnyRec];
+      const r = (await ctxH({ type: "context", messages: live }, cb.ctx)) as { messages?: AnyRec[] } | undefined;
+      check("bash wiring: hook injects the two missing single-! results, not !!",
+        !!r?.messages && r.messages.length === 3 &&
+          r.messages.some((mm) => mm.role === "bashExecution" && mm.command === "echo hi") &&
+          r.messages.some((mm) => mm.command === "sleep 0.5") &&
+          !r.messages.some((mm) => mm.command === "echo secret"));
+      const withAll = [live[0], ...rec.filter((e) => e.type === "message" && (e.message as AnyRec).role === "bashExecution" && !(e.message as AnyRec).excludeFromContext).map((e) => e.message as AnyRec)];
+      check("bash wiring: hook is a no-op once the results are already in state",
+        (await ctxH({ type: "context", messages: withAll }, cb.ctx)) === undefined);
+    }
+
+    // (e) bare ! (no command) is just a message, TUI parity
+    check("bash wiring: bare ! goes to the agent as a message",
+      (await postB("!")).status === 200 && fakeb.sent.some((s) => s.text === "!"));
+  } finally {
+    sseb.close();
+    await fakeb.commands.get("webserve")!.handler("stop", cb.ctx);
+  }
   // --- phase 2: /resume cwd policy (index.ts session_shutdown) ---
   const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-cockpit-st-"));
   const writeHead = (f: string, cwd: string): Promise<void> =>
@@ -961,8 +1130,10 @@ async function wiringTests(): Promise<void> {
       check("wiring: web modal closed when terminal wins (ask-resolved broadcast)",
         sse3.get().includes("ask-resolved") && sse3.get().includes('"id":"tc-b"'));
 
-      // (c) web client answers first -> web wins, terminal overlay closed
-      c3.ask.tuiTypes = true; // would type at +50ms, after the web POST
+      // (c) web client answers first -> web wins, terminal overlay closed.
+      // No terminal timer: the input below is driven explicitly after the web
+      // answer, so nothing races the POST and the settled guard is still tested.
+      c3.ask.tuiTypes = false;
       const p3 = toolCallHandler(askEvent("tc-c"), c3.ctx) as Promise<{ block?: boolean; reason?: string } | undefined>;
       await waitIn3('"id":"tc-c"');
       const ans = await fetch(base3 + "/ask-answer", { method: "POST", headers: { "Content-Type": "application/json", cookie: cookie3 },
@@ -972,6 +1143,9 @@ async function wiringTests(): Promise<void> {
       check("wiring: web answer wins -> block with that envelope",
         r3?.block === true && r3.reason === envelope("A"));
       check("wiring: terminal overlay closed when web wins", c3.ask.doneCalls[c3.ask.doneCalls.length - 1] === null);
+      c3.ask.lastComp?.handleInput("\u001b[B"); c3.ask.lastComp?.handleInput("\r");
+      check("wiring: late terminal input after web answer is ignored",
+        c3.ask.doneCalls[c3.ask.doneCalls.length - 1] === null);
 
       const dup = await fetch(base3 + "/ask-answer", { method: "POST", headers: { "Content-Type": "application/json", cookie: cookie3 },
         body: JSON.stringify({ id: "tc-c", cancelled: false, answers: [{ index: 0, kind: "option", answer: "A" }] }) });
@@ -985,8 +1159,14 @@ async function wiringTests(): Promise<void> {
       const r4 = await p4;
       check("wiring: web decline -> block with canonical decline text",
         r4?.block === true && r4.reason === "User declined to answer questions");
+      check("wiring: terminal overlay closed on web decline",
+        c3.ask.doneCalls[c3.ask.doneCalls.length - 1] === null);
+      c3.ask.lastComp?.handleInput("\u001b[B"); c3.ask.lastComp?.handleInput("\r");
+      check("wiring: late terminal input after web decline is ignored",
+        c3.ask.doneCalls[c3.ask.doneCalls.length - 1] === null);
 
       // (e) the only web client leaves mid-question -> terminal side still resolves it
+      c3.ask.tuiTypes = true; // the terminal timer is the expected resolution here
       const p5 = toolCallHandler(askEvent("tc-e"), c3.ctx) as Promise<{ block?: boolean; reason?: string } | undefined>;
       await waitIn3('"id":"tc-e"');
       sse3.close();
