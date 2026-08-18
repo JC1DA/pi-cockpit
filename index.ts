@@ -164,6 +164,16 @@ export function inputOpts(text: string, idle: boolean, mode: "steer" | "followUp
   };
 }
 
+/**
+ * Names of the extension commands registered in the wiring section below.
+ * Injected into the web page: pi's prompt() executes registered commands
+ * immediately and never records a user entry, so the page must not leave
+ * their bubbles pending in userQ (they would never match and would stay
+ * pinned at the bottom with later content rendered above them). The
+ * selftest asserts this list matches every pi.registerCommand call.
+ */
+export const WEB_COMMANDS = ["new", "compact", "model", "tree", "webserve"];
+
 /** One-line preview of a message entry's text (whitespace-collapsed, capped) for the /tree picker. */
 export function entryPreview(e: AnyRec): string {
   const c = (e.message as AnyRec | undefined)?.content;
@@ -767,6 +777,10 @@ var msgs = document.getElementById('msgs'),
     stopBtn = document.getElementById('stop');
 var curMeta = {}, pendingEl = null, pendingThinkEl = null, pendingTxtEl = null, userQ = [];
 var busy = false, notifOn = false;
+// registered extension commands (kept in sync with the pi.registerCommand
+// list in the extension; the selftest asserts it): they execute immediately
+// and record no user entry, so their bubbles are finalized in place
+var CMD = ${JSON.stringify(WEB_COMMANDS)};
 
 // --- image attachments: 📎 button, paste, or drag & drop onto the input ---
 var attachBtn = document.getElementById('attach'),
@@ -1521,10 +1535,31 @@ function sendText(t, mode) {
   input.value = '';
   var imgs = attachments; attachments = []; renderAtt();
   if (t.charAt(0) === '/' && imgs.length) { imgs = []; alert('commands cannot carry images'); }
-  var el = addMsg('user', esc(t) + imgThumbs(imgs), 'pendinguser');
-  // marker: last chat element existing before this bubble; on the entry's
-  // append the bubble is re-anchored right after it (see renderEntry)
-  userQ.push({ el: el, text: t, images: imgs, marker: el.previousElementSibling });
+  // web !/!! runs host bash (TUI parity): pi records no user entry for it
+  // (only a bashExecution entry), so there is no chat bubble — the bash
+  // card is its representation. A bare ! with nothing after is not a bash
+  // line and sends as a message; a bang with images falls through too.
+  if (t.charAt(0) === '!' && imgs.length === 0 &&
+      (t.charAt(1) === '!' ? t.slice(2) : t.slice(1)).trim()) {
+    postInput(t, mode, []);
+    return;
+  }
+  var cmd = t.charAt(0) === '/' ? t.slice(1).split(' ')[0] : '';
+  if (CMD.indexOf(cmd) >= 0) {
+    // registered commands execute immediately (even mid-stream) and record
+    // no user entry: a pending bubble would never match — it would stay
+    // dashed and pinned at the bottom with all later content rendered above
+    // it. Finalize in place instead; the command's effects (notes) flow below.
+    addMsg('user', esc(t));
+  } else {
+    var el = addMsg('user', esc(t) + imgThumbs(imgs), 'pendinguser');
+    // marker: last chat element existing before this bubble; on the entry's
+    // append the bubble is re-anchored right after it (see renderEntry)
+    userQ.push({ el: el, text: t, images: imgs, marker: el.previousElementSibling });
+  }
+  postInput(t, mode, imgs);
+}
+function postInput(t, mode, imgs) {
   fetch('/input', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

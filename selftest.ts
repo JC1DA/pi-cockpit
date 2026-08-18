@@ -121,6 +121,15 @@ function check(name: string, cond: boolean): void {
     CHAT_PAGE.includes("addEventListener('treepick'") && CHAT_PAGE.includes("sendText('/tree '") &&
     CHAT_PAGE.includes("'treemask'"));
 
+  // divergence guard: the page's injected command list must cover exactly the
+  // commands registered in index.ts — a registered command left out of it would
+  // re-create the stuck-pending-bubble bug its bubble handling avoids.
+  const srcTs = fs.readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+  const regNames = [...srcTs.matchAll(/registerCommand\("([a-zA-Z]+)"/g)].map((m) => m[1]);
+  const cmdArr = JSON.parse((CHAT_PAGE.match(/var CMD = (\[[^\]]*\]);/) ?? ["", "[]"])[1]);
+  check("page: CMD list matches every registered command exactly",
+    regNames.length > 0 && regNames.length === cmdArr.length && regNames.every((n) => cmdArr.includes(n)));
+
   check("page: send is steer-only, no Queue button or followUp path",
     CHAT_PAGE.includes("'steer'") && !CHAT_PAGE.includes("id=\"queue\"") && !CHAT_PAGE.includes("'followUp'"));
 
@@ -1360,6 +1369,44 @@ async function clientOrderingTest(): Promise<void> {
     iS1 >= 0 && iU4 === iS1 + 1 && iS2 === iU4 + 1);
   check("client: steer bubble loses the pending style",
     iU4 >= 0 && !kids3[iU4].className.includes("pendinguser"));
+
+  // --- web ! bash: pi records no user entry for a bang line (only a
+  // bashExecution entry), so no chat bubble either — the bash card is its
+  // representation (TUI parity). A stale bubble would stay pinned at the
+  // bottom with later content rendered above it. ---
+  const nBefore = (handles.msgs().children as E[]).length;
+  idOf("input")!.value = "! git status";
+  handles.send();
+  check("client: bang line creates no bubble and no userQ entry",
+    (handles.msgs().children as E[]).length === nBefore && handles.userQ().length === 0);
+  check("client: bang line still POSTs /input",
+    fetchCalls.some((f) => f.startsWith("/input") && f.includes("git status")));
+  fire("bashstart", { id: "1", command: "git status" });
+  const bangCard = (handles.msgs().children as E[]).slice(-1)[0];
+  check("client: bash card lands at the true end",
+    !!bangCard && bangCard.className === "tool" && (bangCard._text as string).includes("git status"));
+
+  // bare ! is not a bash line: a normal pending bubble, solidified on entry
+  idOf("input")!.value = "!";
+  handles.send();
+  check("client: bare bang renders a pending bubble",
+    (handles.msgs().children as E[]).some((k) => k.className === "msg user pendinguser") && handles.userQ().length === 1);
+  fire("append", { entries: [{ type: "message", id: "mB1", parentId: "mU", timestamp: "20", message: { role: "user", content: [{ type: "text", text: "!" }] } }] });
+  check("client: bare bang entry solidifies its bubble",
+    handles.userQ().length === 0 &&
+    (handles.msgs().children as E[]).some((k) => k.className === "msg user" && (k._text as string) === "!"));
+
+  // --- registered commands: immediate execution, no user entry — the bubble
+  // is finalized in place and the command's effects (notes) flow below it ---
+  idOf("input")!.value = "/compact keep it short";
+  handles.send();
+  const iCmd = (handles.msgs().children as E[]).findIndex((k) => k.className === "msg user" && (k._text as string) === "/compact keep it short");
+  check("client: /compact renders a solid bubble, not a pending userQ entry",
+    iCmd >= 0 && handles.userQ().length === 0);
+  fire("note", { text: "/compact: started — keep it short" });
+  const iNote = (handles.msgs().children as E[]).findIndex((k) => k.className === "note" && (k._text as string).includes("compact: started"));
+  check("client: command note lands directly below its bubble",
+    iCmd >= 0 && iNote === iCmd + 1);
 
   // --- tool output filter: default all; a change flips the body class the CSS keys on ---
   check("client: tool filter defaults to all", doc.body.className.indexOf("ft-all") >= 0);

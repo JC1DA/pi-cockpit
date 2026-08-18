@@ -82,7 +82,11 @@ and folds into a collapsed block above the answer.
   the next LLM request on (via pi's `context` hook; `!!` stays invisible,
   same as the terminal), and the entry persists across restarts and shows
   to other web clients. Bare `!` (no command) is sent as a normal message,
-  matching the terminal. One bash command at a time: a second one while a
+  matching the terminal. The bang line itself never becomes a chat bubble —
+  pi records no user entry for it (only the `bashExecution` entry), so the
+  live bash card is its only representation (TUI parity); a bubble would have
+  no entry to anchor to and would have stuck pinned at the bottom. One bash
+  command at a time: a second one while a
   command runs is rejected with a note (the terminal has the same rule). The
   web has no Esc, so a hung command is killed after 10 minutes and recorded
   as cancelled. Terminal `!` / `!!` behavior is unchanged. This is the one
@@ -97,8 +101,10 @@ and folds into a collapsed block above the answer.
   session tree. Bare `/model` opens a one-click picker modal of all available
   models; bare `/tree` opens a one-click picker of the session's user messages
   (the current leaf marked; picking one is the same as typing the command).
-  Commands execute immediately, even while the agent is busy, and results show
-  as notes in the web view.
+  Commands execute immediately, even while the agent is busy. In the web view
+  each command shows as a solid user bubble in place (pi records no user entry
+  for registered commands, so there is nothing to re-anchor) with its results
+  as notes directly below it.
   Other `/`-prefixed input follows terminal semantics (skills, prompt
   templates; unknown text goes to the model as literal text).
 - The **Stop** button in the web header behaves like Esc in the terminal.
