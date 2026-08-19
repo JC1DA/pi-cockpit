@@ -6,6 +6,10 @@ agent's questions. One file; the only non-node: imports are pi's own bundled pac
 (for the terminal-side question dialog) and `pi-coding-agent` (web `!` bash
 execution and shell settings).
 
+## Demo
+
+[![pi-cockpit demo](https://i.ytimg.com/vi/Vb8InJ3bRk0/maxresdefault.jpg)](https://www.youtube.com/shorts/Vb8InJ3bRk0)
+
 ## Install
 
 ```bash
