@@ -108,6 +108,22 @@ and folds into a collapsed block above the answer.
   each command shows as a solid user bubble in place (pi records no user entry
   for registered commands, so there is nothing to solidify) with its results
   as notes directly below it.
+- **Branch / rewind on any answer** — every finalized answer bubble carries
+  two small actions (hover-revealed on desktop, always visible on touch; hidden
+  while a run is in flight, since pi's tree navigation throws while
+  streaming): **↻ branch** navigates the session tree to that answer, so the
+  next message you send becomes a sibling of it — a fresh take on the same
+  question with the previous answer kept in context; **↩ rewind** navigates to
+  the user message that produced the answer, which pi re-parents to its
+  parent, dropping the exchange out of the live path, and pre-fills the input
+  box with that message (the TUI `/tree` editor-text parity) so you can
+  re-send it, edit it, or discard it. Both are the `/tree` command, so they
+  show as solid command bubbles like the pickers do, and the terminal sees the
+  same navigation. A user target notes as `rewound before "<message>"` (named,
+  not id) while an answer target notes as `jumped to <id>`. The producer is
+  resolved at click time from the nearest user bubble above the answer, which
+  stays correct even when the user entry persists after the reply already
+  finalized (steer).
   Other `/`-prefixed input follows terminal semantics (skills, prompt
   templates; unknown text goes to the model as literal text).
 - The **Stop** button in the web header behaves like Esc in the terminal.
@@ -168,7 +184,7 @@ and folds into a collapsed block above the answer.
 
 ## Tests
 - `npm install` (dev-only type deps), then:
-  - `node selftest.ts` — 231 unit + HTTP-protocol checks (password,
+  - `node selftest.ts` — 241 unit + HTTP-protocol checks (password,
     tokens/cookie, sanitizer, leaf diff, session cost: usage sources (assistant,
     toolResult, compaction, branch_summary), zero/negative/malformed safety,
     page syntax + usage/cost formatting, tab-title ⏳ prefix,
@@ -182,6 +198,10 @@ and folds into a collapsed block above the answer.
     duplicate 409, pending ask survives client departure + replay to a
     reconnecting client (server level and through the hook), no zombie modal
     on a pre-aborted signal,
+    branch/rewind answer actions: /tree note wording for user vs assistant
+    targets (rewound before "<message>" / jumped to <id>), page wiring,
+    DOM-stub clicks (branch POST, rewind POST + input pre-fill + focus,
+    late-steer producer resolution, busy no-op),
     agent_settled trailing-entry flush, web-client ordering under the pi
     persist-after-emit contract, run by driving the real page script in a
     DOM stub).
@@ -200,7 +220,12 @@ and folds into a collapsed block above the answer.
   from the web modal (agent continues with the answer; also try answering in
   the terminal, and with both open at once — first answer wins) → with a
   priced model, check the header shows the session cost and finalized answers
-  carry a per-call cost tag → click 🔔
+  carry a per-call cost tag → on an older answer, click `↻ branch` and send a
+  new message (note `jumped to <id>` in the view; the new answer is a sibling
+  of the old one, which stays in context) → on the latest answer, click
+  `↩ rewind` (note `rewound before "<question>"`; the last Q&A pair leaves the
+  view and the input box is pre-filled with that question — press Enter to
+  re-send it or edit it first) → click 🔔
   (allow), send a message, and hide the tab — a notification arrives when the
   run finishes (on plain-HTTP LAN the 🔔 is hidden; instead the tab title
   shows ⏳ while busy) → Stop mid-run → `/webserve stop` → second terminal

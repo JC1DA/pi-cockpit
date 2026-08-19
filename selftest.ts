@@ -160,6 +160,15 @@ function check(name: string, cond: boolean): void {
     CHAT_PAGE.includes("addEventListener('treepick'") && CHAT_PAGE.includes("sendText('/tree '") &&
     CHAT_PAGE.includes("'treemask'"));
 
+  check("page: finalized answers carry branch + rewind actions wired to /tree via the input path",
+    CHAT_PAGE.includes("function attachActs") &&
+    CHAT_PAGE.includes("'↻ branch'") && CHAT_PAGE.includes("'↩ rewind'") &&
+    CHAT_PAGE.includes("sendText('/tree ' + id)") && CHAT_PAGE.includes("sendText('/tree ' + pid)"));
+  check("page: actions hidden while busy (body class + JS guard), hover-revealed on desktop",
+    CHAT_PAGE.includes("document.body.classList.toggle('busy', b)") &&
+    CHAT_PAGE.includes("body.busy .acts{display:none}") &&
+    CHAT_PAGE.includes("@media (hover:hover){.msg .acts{opacity:0"));
+
   // divergence guard: the page's injected command list must cover exactly the
   // commands registered in index.ts — a registered command left out of it would
   // re-create the stuck-pending-bubble bug its bubble handling avoids.
@@ -978,7 +987,8 @@ async function wiringTests(): Promise<void> {
     check("wiring: web /model without API key reports failure",
       client.get().includes("no API key for p3/m2") && fake1.setModelCalls.length === 2);
 
-    // web /tree: picker broadcast, jump, already-at, unknown id
+    // web /tree: picker broadcast, rewind (user target), already-at, unknown
+    // id, plain jump (assistant target — the branch action's shape)
     await fake1.commands.get("tree")!.handler("", c1.ctx);
     await waitUntil("event: treepick", 3000);
     check("wiring: web /tree broadcasts a picker with user-message jump points",
@@ -986,9 +996,9 @@ async function wiringTests(): Promise<void> {
       client.get().includes('"current":"e1"') && client.get().includes('"text":"second"'));
 
     await fake1.commands.get("tree")!.handler("e2", c1.ctx);
-    await waitUntil("jumped to", 3000);
-    check("wiring: web /tree id calls navigateTree and notes the jump",
-      client.get().includes("/tree: jumped to e2") && c1.navCalls.length === 1 && c1.navCalls[0] === "e2");
+    await waitUntil("rewound before", 3000);
+    check("wiring: web /tree to a user entry calls navigateTree and notes the rewind with the message",
+      client.get().includes('rewound before \\"second\\"') && c1.navCalls.length === 1 && c1.navCalls[0] === "e2");
 
     await fake1.commands.get("tree")!.handler("e2", c1.ctx);
     await waitUntil("already at", 3000);
@@ -999,6 +1009,13 @@ async function wiringTests(): Promise<void> {
     await waitUntil("not found", 3000);
     check("wiring: web /tree unknown entry notes an error",
       client.get().includes("Entry nope not found") && c1.navCalls.length === 3);
+
+    // assistant target (the ↻ branch action): plain jump — the next message
+    // becomes a sibling of the answer, which stays in context
+    await fake1.commands.get("tree")!.handler("e3", c1.ctx);
+    await waitUntil("jumped to e3", 3000);
+    check("wiring: web /tree to an assistant entry notes a plain jump",
+      client.get().includes("/tree: jumped to e3") && c1.navCalls[c1.navCalls.length - 1] === "e3");
 
     // pi 0.84.x persists each message only AFTER its message_end handlers ran,
     // so the run's trailing entry is one leaf behind and never reaches web
@@ -1363,7 +1380,7 @@ async function clientOrderingTest(): Promise<void> {
     el.querySelectorAll = () => [];
     el.addEventListener = (t: string, f: (...a: unknown[]) => void) => { (el.listeners ??= {} as Record<string, any>)[t] = f; };
     el.setAttribute = () => {};
-    el.focus = () => {};
+    el.focus = () => { el.focused = true; };
     allEls.push(el);
     return el;
   };
@@ -1524,6 +1541,46 @@ async function clientOrderingTest(): Promise<void> {
   const iNote = (handles.msgs().children as E[]).findIndex((k) => k.className === "note" && (k._text as string).includes("compact: started"));
   check("client: command note lands directly below its bubble",
     iCmd >= 0 && iNote === iCmd + 1);
+
+  // --- branch/rewind actions on finalized answers: both are /tree commands;
+  // branch navigates to the answer itself, rewind navigates to the user entry
+  // that produced it (resolved at click time from the nearest tagged bubble
+  // above, then the input is pre-filled with that message) ---
+  const mA = (handles.msgs().children as E[]).find((k) => k.className === "msg assistant md" && (k._text as string).includes("<p>done</p>"));
+  const acts = mA ? ((mA.children as E[]).find((c) => c.className === "acts") as E) : null;
+  check("client: finalized answer carries a branch + rewind action row",
+    !!acts && acts.children.length === 2 && (acts.children as E[]).every((s) => s.className === "act"));
+  check("client: action labels are branch and rewind",
+    !!acts && (acts.children as E[]).map((s) => s._text).join(" | ") === "↻ branch | ↩ rewind");
+  if (acts) {
+    const n0 = fetchCalls.length;
+    (acts.children as E[])[0].listeners.click();
+    check("client: branch POSTs /tree <answer-id> and renders a solid command bubble",
+      fetchCalls.length === n0 + 1 && fetchCalls[n0].includes('"/tree mA"') &&
+      (handles.msgs().children as E[]).some((k) => k.className === "msg user" && k._text === "/tree mA"));
+    (acts.children as E[])[1].listeners.click();
+    check("client: rewind POSTs /tree <producer-id> and pre-fills the input with the producer's text",
+      fetchCalls[fetchCalls.length - 1].includes('"/tree mU"') && idOf("input")!.value === "hello" && idOf("input")!.focused === true);
+
+    // the steer's answer finalized BEFORE its user entry persisted — the
+    // click-time walk must still resolve the producer to the (late) bubble
+    const mS2 = (handles.msgs().children as E[]).find((k) => (k._text as string).includes("answer to steer (truncated)"));
+    const acts2 = mS2 ? ((mS2.children as E[]).find((c) => c.className === "acts") as E) : null;
+    check("client: the late-steer answer also carries an action row", !!acts2);
+    if (acts2) {
+      (acts2.children as E[])[1].listeners.click();
+      check("client: rewind on the late-steer answer targets the steer's own user entry",
+        fetchCalls[fetchCalls.length - 1].includes('"/tree mU4"') && idOf("input")!.value === "steer question");
+    }
+
+    // busy: the actions no-op (pi's navigateTree throws mid-stream)
+    fire("status", { busy: true });
+    const n2 = fetchCalls.length;
+    (acts.children as E[])[0].listeners.click();
+    (acts.children as E[])[1].listeners.click();
+    check("client: actions are no-ops while busy", fetchCalls.length === n2);
+    fire("status", { busy: false });
+  }
 
   // --- tool output filter: default all; a change flips the body class the CSS keys on ---
   check("client: tool filter defaults to all", doc.body.className.indexOf("ft-all") >= 0);

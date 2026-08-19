@@ -69,6 +69,14 @@ in a browser, enter the password, and the session streams live:
   [provider/model-id]` switches the model (bare `/model` lists the available
   ones) — all run immediately, even while busy, and results appear as notes in
   the view.
+- **Branch / rewind** — every finalized answer bubble carries small actions
+  (hover-revealed on desktop, always visible on touch; hidden while the agent
+  runs): `↻ branch` re-continues from that answer — your next message becomes
+  a sibling of it, a new take on the same question with the old answer kept in
+  context — and `↩ rewind` moves the session back past the question that
+  produced it, pre-filling the input box with that question so you can
+  re-send it, edit it, or drop it (both are the `/tree` command, visible in
+  the terminal as the same navigation).
 - **Stop** in the header interrupts the run, exactly like Esc.
 - **Finish notifications** — the 🔔 header button asks for notification
   permission; while the tab is hidden, each finished run pings you with the
@@ -108,15 +116,17 @@ gets its own server (8765, 8766, ...).
 
 ```bash
 npm install               # dev-only type deps
-node selftest.ts          # 231 checks: password, tokens, sanitizer, leaf diff,
+node selftest.ts          # 241 checks: password, tokens, sanitizer, leaf diff,
                           # input dispatch, web ! bash (parser, output cleaning, truncation +
                           # full-output file, real-shell runs, SSE streaming, session
                           # recording, agent-context injection, one-at-a-time), page JS (incl.
                           # usage/cost formatting, tab-title prefix, finish notifications,
                           # markdown rendering), HTTP protocol, live SSE, pi wiring (factory
                           # re-run across session replacement, usage + cost refresh, /resume
-                          # cwd policy), ask bridge (envelope wording, TUI component, HTTP ask
-                          # flow, first-answer-wins hook wiring)
+                          # cwd policy), branch/rewind actions (/tree note wording, DOM-stub
+                          # clicks incl. late-steer producer + busy no-op), ask bridge
+                          # (envelope wording, TUI component, HTTP ask flow, first-answer-wins
+                          # hook wiring)
 npx tsc -p tsconfig.json  # strict type check
 ```
 

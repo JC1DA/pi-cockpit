@@ -728,6 +728,11 @@ header button#notif.on{opacity:1;border-color:#60a5fa}
 .msg .thinkbox summary{cursor:pointer;color:var(--dim);font-size:12px}
 .msg .thinkbox pre{margin:4px 0 0;padding:6px 8px;background:#0d0d0f;border:1px solid #333;border-radius:6px;white-space:pre-wrap;font-size:12px;color:var(--dim);font-style:italic}
 .msg .m-cost{display:block;margin-top:6px;text-align:right;color:var(--dim);font-size:11px}
+.msg .acts{margin-top:6px}
+.msg .acts .act{display:inline-block;margin:0 6px 0 0;padding:1px 8px;border:1px solid #333;border-radius:6px;font-size:11px;color:var(--dim);cursor:pointer;user-select:none}
+.msg .acts .act:hover{color:var(--text);border-color:#60a5fa}
+body.busy .acts{display:none}
+@media (hover:hover){.msg .acts{opacity:0;transition:opacity .1s}.msg:hover .acts{opacity:1}}
 details.tool{align-self:flex-start;max-width:85%;background:var(--tool);border:1px solid #333;border-radius:8px;padding:4px 8px}
 details.tool.err{border-color:#b91c1c}
 details.tool summary{cursor:pointer;color:var(--dim);font-size:12px}
@@ -967,6 +972,43 @@ function thinkHtml(t) {
   if (!t) return '';
   return '<details class="thinkbox"><summary>💭 thinking · ' + t.length + ' chars</summary><pre>' + esc(t) + '</pre></details>';
 }
+// Branch/rewind actions on a finalized answer bubble. Both are the /tree
+// command: branch navigates to this answer (the next message becomes its
+// sibling — a new take on the same question, this answer still in context);
+// rewind navigates to the user message that produced this answer, which pi
+// re-parents to its parent, so the exchange drops out of the path — and the
+// input is pre-filled with that message (the TUI navigateTree editorText
+// parity) to re-send it, edit it, or drop it. The producer is resolved at
+// click time, from the nearest tagged user bubble above: a user entry can
+// persist AFTER its reply already finalized (steer), so a render-time
+// snapshot would be stale.
+function attachActs(el, id) {
+  var row = document.createElement('div');
+  row.className = 'acts';
+  var mk = function (label, fn) {
+    var s = document.createElement('span');
+    s.className = 'act';
+    s.textContent = label;
+    s.addEventListener('click', fn);
+    row.appendChild(s);
+  };
+  mk('↻ branch', function () {
+    if (busy) return; // pi's navigateTree throws mid-stream
+    sendText('/tree ' + id);
+  });
+  mk('↩ rewind', function () {
+    if (busy) return;
+    var kids = msgs.children, pid = '', ptxt = '';
+    for (var i = 0; i < kids.length; i++) {
+      if (kids[i] === el) break;
+      if (kids[i]._uid) { pid = kids[i]._uid; ptxt = kids[i]._utext || ''; }
+    }
+    if (!pid) return;
+    sendText('/tree ' + pid);
+    if (ptxt) { input.value = ptxt; input.focus(); }
+  });
+  el.appendChild(row);
+}
 function addMsg(role, html, cls) {
   var d = document.createElement('div');
   d.className = 'msg ' + role + (cls ? ' ' + cls : '');
@@ -1048,6 +1090,7 @@ function setBusy(b) {
   dot.classList.toggle('busy', b);
   stopBtn.classList.toggle('show', b);
   input.placeholder = b ? 'Agent busy — Send steers this run' : 'Message...';
+  document.body.classList.toggle('busy', b); // hides the branch/rewind actions mid-run (navigateTree throws while streaming)
   document.title = (busy ? '⏳ ' : '') + (curMeta.sessionName || 'pi session');
   if (was && !b) notifyDone();
 }
@@ -1082,6 +1125,7 @@ function renderEntry(en) {
       for (; i < userQ.length; i++) {
         if (userQ[i].text === t && (userQ[i].images || []).length === imgParts.length) { hit = userQ[i]; break; }
       }
+      var ub = null;
       if (hit) {
         userQ.splice(i, 1);
         // pi 0.84.x persists the user entry only after the reply has started
@@ -1089,9 +1133,13 @@ function renderEntry(en) {
         // its chronological spot (agent content appends below it), so only
         // the pending style drops.
         hit.el.classList.remove('pendinguser');
+        ub = hit.el;
       } else {
-        addMsg('user', esc(t) + imgThumbs(imgParts));
+        ub = addMsg('user', esc(t) + imgThumbs(imgParts));
       }
+      // tag the bubble with its entry id so an answer's rewind action can
+      // target it (the entry can persist after the reply already finalized)
+      if (ub && en.id) { ub._uid = en.id; ub._utext = t; }
     } else if (m.role === 'assistant') {
       var texts = [];
       (Array.isArray(m.content) ? m.content : []).forEach(function (p) {
@@ -1114,14 +1162,16 @@ function renderEntry(en) {
       var costHtml = '';
       var ct = m.usage && m.usage.cost ? m.usage.cost.total : 0;
       if (typeof ct === 'number' && ct > 0) costHtml = '<span class="m-cost">' + fmtCost(ct) + '</span>';
+      var bubble = null;
       if (pendingEl) {
         // finalize the streaming bubble in place so it keeps its position;
         // swap the raw streaming text for rendered markdown, with a collapsed
         // thinking block above it when the model thought before answering
-        if (full || think) { pendingEl.classList.remove('pending'); pendingEl.classList.add('md'); pendingEl.innerHTML = thinkHtml(think) + md(full) + costHtml; }
+        if (full || think) { pendingEl.classList.remove('pending'); pendingEl.classList.add('md'); pendingEl.innerHTML = thinkHtml(think) + md(full) + costHtml; bubble = pendingEl; }
         else { pendingEl.remove(); }
         pendingEl = pendingThinkEl = pendingThinkSum = pendingThinkBody = pendingTxtEl = null;
-      } else if (full || think) { addMsg('assistant', thinkHtml(think) + md(full) + costHtml, 'md'); }
+      } else if (full || think) { bubble = addMsg('assistant', thinkHtml(think) + md(full) + costHtml, 'md'); }
+      if (bubble && en.id) attachActs(bubble, en.id);
     } else if (m.role === 'toolResult') {
       var out = textOf(m.content);
       // ask bridge: pi flags blocked calls isError, but an answered/declined
@@ -2485,10 +2535,14 @@ export default function (pi: ExtensionAPI): void {
   // /tree — the built-in one is a TUI picker; this gives the web viewer its
   // own. Bare /tree broadcasts the session's user messages as a `treepick`
   // event; the web page renders a one-click picker whose pick re-sends
-  // `/tree <entry-id>`. ctx.navigateTree is the same runtime op as the TUI's
-  // /tree: it throws while streaming, no-ops at the target, and fires
-  // session_tree (listened above), which resyncs every web client. No branch
-  // summary is requested (the TUI prompts for one; the web stays minimal).
+  // `/tree <entry-id>`. The page's answer bubbles use the same command
+  // directly: ↻ branch navigates to an answer entry (the next message becomes
+  // its sibling); ↩ rewind navigates to a user entry, which pi re-parents to
+  // its parent (the exchange drops out of the path). ctx.navigateTree is the
+  // same runtime op as the TUI's /tree: it throws while streaming, no-ops at
+  // the target, and fires session_tree (listened above), which resyncs every
+  // web client. No branch summary is requested (the TUI prompts for one; the
+  // web stays minimal).
   pi.registerCommand("tree", {
     description: "Jump to a previous point in this session: /tree [entry-id]",
     handler: async (args, ctx) => {
@@ -2515,7 +2569,14 @@ export default function (pi: ExtensionAPI): void {
         return;
       }
       const after = ctx.sessionManager.getLeafId();
-      server?.broadcast("note", { text: r.cancelled ? "/tree: cancelled" : after !== before ? "/tree: jumped to " + pick : "/tree: already at " + pick });
+      // A user target reads as a rewind: pi re-parents the leaf to the target's
+      // parent, so the note names the message, not the id.
+      const target = (ctx.sessionManager.getEntries() as unknown as AnyRec[]).find((e) => e.id === pick);
+      const isUserTarget = target?.type === "message" && (target.message as AnyRec | undefined)?.role === "user";
+      const note = r.cancelled ? "/tree: cancelled"
+        : after !== before ? (isUserTarget ? "/tree: rewound before \"" + (entryPreview(target as AnyRec) || pick) + "\"" : "/tree: jumped to " + pick)
+        : "/tree: already at " + pick;
+      server?.broadcast("note", { text: note });
     },
   });
 
