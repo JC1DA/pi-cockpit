@@ -151,6 +151,12 @@ function check(name: string, cond: boolean): void {
 
   check("page: mobile CSS wraps meta and hides cwd",
     CHAT_PAGE.includes("@media (max-width:640px)") && CHAT_PAGE.includes("m-cwd"));
+  check("page: mobile composer prevents iOS focus zoom and horizontal overflow",
+    CHAT_PAGE.includes("html,body{width:100%;max-width:100%;overflow-x:hidden}") &&
+    CHAT_PAGE.includes("height:100dvh") &&
+    CHAT_PAGE.includes("#attrow{display:flex;gap:8px;min-width:0;width:100%}") &&
+    CHAT_PAGE.includes("footer textarea{flex:1;min-width:0;width:100%;max-width:100%") &&
+    CHAT_PAGE.includes("font-size:16px"));
 
   check("page: model picker modal wired (modelpick event -> /model command via /input)",
     CHAT_PAGE.includes("addEventListener('modelpick'") && CHAT_PAGE.includes("sendText('/model '") &&
